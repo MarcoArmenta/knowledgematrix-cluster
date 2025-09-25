@@ -3,7 +3,7 @@
 """
 from torch import nn
 from torchvision.models import alexnet, AlexNet_Weights
-from typing import Union
+import torch
 
 from knowledgematrix.neural_net import NN
 
@@ -13,30 +13,37 @@ class AlexNet(NN):
         The AlexNet model.
 
         Args:
-            input_shape (Tuple[int]): The shape of the input to the network.
+            input_shape (Tuple[int]): The shape of the input to the network (e.g., (3, 224, 224) for pretrained).
             num_classes (int): The number of classes in the dataset.
             save (bool): Whether to save the activations and preactivations of the network.
-            pretrained (bool): Whether to use pretrained weights.
-            pretrained_model (Union[alexnet, None]): You can pass in a custom alexnet model to use as pretrained weights. If None, the default pretrained weights will be used.
+            pretrained (bool): Whether to use pretrained weights (set to True for transfer learning).
+            freeze_features (bool): Whether to freeze the feature extractor layers during transfer learning.
             device (str): The device to run the network on.
     """
     def __init__(
-            self, 
+            self,
             input_shape: tuple[int],
             num_classes: int,
-            save: bool=False, 
+            save: bool=False,
             pretrained: bool=False,
-            pretrained_model: Union[alexnet, None]=None,
+            freeze_features: bool=True,
             device: str="cpu"
         ) -> None:
         super().__init__(input_shape, save, device)
 
         if pretrained:
-            if pretrained_model is None:
-                pretrained_model = alexnet(weights=AlexNet_Weights.DEFAULT)
-            else:
-                if not isinstance(pretrained_model, alexnet):
-                    raise ValueError("pretrained_model must be an instance of alexnet.")
+            print("Using AlexNet pretrained weights", flush=True)
+            if input_shape[0] != 3:
+                raise ValueError("AlexNet requires images with 3 channels. Please use input_shape=(3, -, -).")
+            # Load pretrained model (ignores num_classes check for transfer learning)
+
+            path_w = 'experiments/alexnet_imagenet/weights/pretrained-weights.pth'
+            pretrained_model = alexnet()
+            state_dict = torch.load(path_w, map_location=self.device)
+
+            pretrained_model.to(self.device)
+            pretrained_model.load_state_dict(state_dict)
+
             for layer in pretrained_model.children():
                 if isinstance(layer, nn.Sequential):
                     for sublayer in layer.children():
@@ -51,12 +58,25 @@ class AlexNet(NN):
                 elif isinstance(layer, nn.AdaptiveAvgPool2d):
                     self.adaptiveavgpool(output_size=layer.output_size)
                     self.flatten()
-            if input_shape[0] != 3:
-                print(f"Warning: The pretrained model was trained on 3-channel images. The input shape is {input_shape}. The first layer won't have pretrained weights.")
-                self.layers[0] = nn.Conv2d(input_shape[0], 64, kernel_size=11, stride=4, padding=2)
-            elif num_classes != 1000:
-                print(f"Warning: The pretrained model was trained on 1000 classes. The number of classes is {num_classes}. The last layer won't have pretrained weights.")
-                self.layers[-1] = nn.Linear(4096, num_classes)
+
+            # Replace the last linear layer for the new number of classes
+            if num_classes != 1000:
+                # Find the last linear layer (classifier's output layer)
+                for i in range(len(self.layers) - 1, -1, -1):
+                    if isinstance(self.layers[i], nn.Linear) and self.layers[i].out_features == 1000:
+                        in_features = self.layers[i].in_features  # Should be 4096
+                        self.layers[i] = nn.Linear(in_features, num_classes)
+                        break
+                else:
+                    raise ValueError("Could not find the output linear layer to replace for transfer learning.")
+
+            # Optionally freeze the feature extractor (convolutional layers)
+            if freeze_features:
+                for layer in self.layers:
+                    if isinstance(layer, nn.Conv2d):
+                        for param in layer.parameters():
+                            param.requires_grad = False
+
         else:
             self.conv(self.input_shape[0], 64, kernel_size=11, stride=4, padding=2)
             self.relu()
