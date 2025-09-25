@@ -39,7 +39,7 @@ class KnowledgeMatrixComputer:
             Returns:
                 torch.Tensor: The knowledge matrix of the NN at the input point
         """
-	with torch.no_grad():
+        with torch.no_grad():
             # Saves activations and pre-activations
             self.model.save = True
             self.current_output = self.model.forward(x)
