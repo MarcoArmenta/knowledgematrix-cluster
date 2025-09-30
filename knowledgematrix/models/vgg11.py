@@ -2,7 +2,8 @@
     Implementation of VGG-11
 """
 from torch import nn
-from torchvision.models import vgg11, VGG11_Weights
+from torchvision.models import vgg11
+import torch
 
 from knowledgematrix.neural_net import NN
 
@@ -24,13 +25,21 @@ class VGG11(NN):
             num_classes: int,
             save: bool=False,
             pretrained: bool=False,
-            device: str="cpu"
+            device: str="cpu",
+            freeze_features: bool = True,
         ) -> None:
         super().__init__(input_shape, save, device)
         if pretrained:
-            if input_shape[0] != 3 or num_classes != 1000:
+            if input_shape[0] != 3:
                 raise ValueError("VGG11 was trained on images with 3 channels and 1000 classes. Please use input_shape=(3, -, -) and num_classes=1000 for pretrained VGG11.")
-            for layer in vgg11(weights=VGG11_Weights.DEFAULT).children():
+            path_w = 'experiments/vgg_imagenet/weights/pretrained-weights.pth'
+            pretrained_model = vgg11()
+            state_dict = torch.load(path_w, map_location=self.device)
+
+            pretrained_model.to(self.device)
+            pretrained_model.load_state_dict(state_dict)
+
+            for layer in pretrained_model.children():
                 if isinstance(layer, nn.Sequential):
                     for sublayer in layer.children():
                         if isinstance(sublayer, (nn.Conv2d, nn.Linear)):
@@ -44,6 +53,24 @@ class VGG11(NN):
                 elif isinstance(layer, nn.AdaptiveAvgPool2d):
                     self.adaptiveavgpool(output_size=layer.output_size)
                     self.flatten()
+
+            # Replace the last linear layer for the new number of classes
+            if num_classes != 1000:
+                # Find the last linear layer (classifier's output layer)
+                for i in range(len(self.layers) - 1, -1, -1):
+                    if isinstance(self.layers[i], nn.Linear) and self.layers[i].out_features == 1000:
+                        in_features = self.layers[i].in_features  # Should be 4096
+                        self.layers[i] = nn.Linear(in_features, num_classes)
+                        break
+                else:
+                    raise ValueError("Could not find the output linear layer to replace for transfer learning.")
+
+            # Optionally freeze the feature extractor (convolutional layers)
+            if freeze_features:
+                for layer in self.layers:
+                    if isinstance(layer, nn.Conv2d):
+                        for param in layer.parameters():
+                            param.requires_grad = False
         else:
             # Convolutional Layers
             self.conv(input_shape[0], 64, kernel_size=3, padding=1)

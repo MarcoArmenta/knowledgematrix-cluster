@@ -24,10 +24,10 @@ class AlexNet(NN):
             self,
             input_shape: tuple[int],
             num_classes: int,
-            save: bool=False,
-            pretrained: bool=False,
-            freeze_features: bool=True,
-            device: str="cpu"
+            save: bool = False,
+            pretrained: bool = False,
+            freeze_features: bool = True,
+            device: str = "cpu"
         ) -> None:
         super().__init__(input_shape, save, device)
 

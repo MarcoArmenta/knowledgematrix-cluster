@@ -2,7 +2,8 @@
     Implementation of ResNet-18
 """
 from torch import nn
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet18
+import torch
 
 from knowledgematrix.neural_net import NN
 
@@ -22,16 +23,24 @@ class ResNet18(NN):
             self,
             input_shape: tuple[int],
             num_classes: int,
-            save: bool=False,
-            pretrained: bool=False,
-            device: str="cpu"
+            save: bool = False,
+            pretrained: bool = False,
+            freeze_features: bool = True,
+            device: str = "cpu"
         ) -> None:
         super().__init__(input_shape, save, device)
 
         if pretrained:
-            if input_shape[0] != 3 or num_classes != 1000:
+            if input_shape[0] != 3:
                 raise ValueError("ResNet18 was trained on images with 3 channels and 1000 classes. Please use input_shape=(3, -, -) and num_classes=1000 for pretrained ResNet18.")
-            for layer in resnet18(weights=ResNet18_Weights.DEFAULT).children():
+            path_w = 'experiments/resnet_imagenet/weights/pretrained-weights.pth'
+            pretrained_model = resnet18()
+            state_dict = torch.load(path_w, map_location=self.device)
+
+            pretrained_model.to(self.device)
+            pretrained_model.load_state_dict(state_dict)
+
+            for layer in pretrained_model.children():
                 if isinstance(layer, nn.Sequential):
                     for basic_block in layer.children():
                         start_skip = self.get_num_layers()
@@ -55,6 +64,23 @@ class ResNet18(NN):
                     self.flatten()
                 elif isinstance(layer, nn.MaxPool2d):
                     self.maxpool(kernel_size=layer.kernel_size, stride=layer.stride, padding=layer.padding)
+
+            # Replace the last linear layer for the new number of classes
+            if num_classes != 1000:
+                # Find the last linear layer (classifier's output layer)
+                for i in range(len(self.layers) - 1, -1, -1):
+                    if isinstance(self.layers[i], nn.Linear) and self.layers[i].out_features == 1000:
+                        in_features = self.layers[i].in_features  # Should be 4096
+                        self.layers[i] = nn.Linear(in_features, num_classes)
+                        break
+                else:
+                    raise ValueError("Could not find the output linear layer to replace for transfer learning.")
+            # Optionally freeze the feature extractor (convolutional layers)
+            if freeze_features:
+                for layer in self.layers:
+                    if isinstance(layer, nn.Conv2d):
+                        for param in layer.parameters():
+                            param.requires_grad = False
         else:
             self.conv(self.input_shape[0], 64, kernel_size=3, stride=1, padding=1, bias=False)
             self.batchnorm(64)
