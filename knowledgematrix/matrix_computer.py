@@ -26,15 +26,19 @@ class KnowledgeMatrixComputer:
         self.layers = model.layers
         self.device = device
         if type(model.input_shape) == int:
-            self.input_size = 1
+            self.input_size = model.input_shape
             self.in_c = 1
-            self.in_h = model.input_shape[0]
+            self.in_h = model.input_shape
             self.in_w = 1
+        elif len(model.input_shape) == 2:
+            self.in_c, self.in_w = model.input_shape
+            self.in_h = 1
+            self.input_size = self.in_c * self.in_h * self.in_w
         elif len(model.input_shape) == 3:
             self.in_c, self.in_h, self.in_w = model.input_shape
-            self.input_size = self.in_c*self.in_h*self.in_w
+            self.input_size = self.in_c * self.in_h * self.in_w
         else:
-            raise ValueError(f"Non suported shape {model.shape}")
+            raise ValueError(f"Non supported shape {model.input_shape}")
 
         # Saves the output of the NN on the current sample in the forward method
         self.current_output: Union[NN, None] = None
@@ -53,11 +57,10 @@ class KnowledgeMatrixComputer:
             self.current_output = self.model.forward(x)
             self.model.save = False
 
-
             # Total number of positions and batches needed
             C, H, W = self.in_c, self.in_h, self.in_w
-            total_positions = C*H*W
-            num_batches = (total_positions + self.batch_size - 1)//self.batch_size
+            total_positions = C * H * W
+            num_batches = (total_positions + self.batch_size - 1) // self.batch_size
 
             A = torch.Tensor().to(self.device)  # Will become the matrix M(W,f)(x)
             for batch in range(num_batches):
@@ -70,12 +73,11 @@ class KnowledgeMatrixComputer:
 
                 # Create indices for this batch
                 indices = torch.arange(start, end, device=self.device)
-                c = indices // (H*W)
-                remaining = indices % (H*W)
+                c = indices // (H * W)
+                remaining = indices % (H * W)
                 h = remaining // W
                 w = remaining % W
 
-                # Create batched input for this chunk
                 # Create batched input for this chunk
                 batched_input = torch.zeros((current_batch_size, C, H, W), device=self.device)
                 batched_input[torch.arange(current_batch_size).to(self.device), c, h, w] = x.flatten()[start:end].to(
@@ -103,22 +105,38 @@ class KnowledgeMatrixComputer:
                         B = B * vertices
                     elif isinstance(layer, nn.Conv2d):
                         B = F.conv2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding)
+                    elif isinstance(layer, nn.Conv1d):
+                        B = F.conv1d(B.squeeze(2), layer.weight, None, stride=layer.stride, padding=layer.padding)
+                        B = B.unsqueeze(2)
+                    elif isinstance(layer, nn.ConvTranspose2d):
+                        B = F.conv_transpose2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding, output_padding=layer.output_padding)
+                    elif isinstance(layer, nn.ConvTranspose1d):
+                        B = F.conv_transpose1d(B.squeeze(2), layer.weight, None, stride=layer.stride, padding=layer.padding, output_padding=layer.output_padding)
+                        B = B.unsqueeze(2)
                     elif isinstance(layer, (nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Flatten)):
                         B = layer(B)
                     elif isinstance(layer, nn.Linear):
-                        B = torch.matmul(layer.weight, B.T).T
-                    elif isinstance(layer, nn.BatchNorm2d):
+                        B = B.reshape(current_batch_size, -1)
+                        B = torch.matmul(layer.weight, B.transpose(-1, -2)).transpose(-1, -2)
+                    elif isinstance(layer, (nn.BatchNorm2d, nn.BatchNorm1d)):
                         B = B * (layer.weight / torch.sqrt(layer.running_var + layer.eps)).view(1, -1, 1, 1)
                     elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
                         pool = self.model.maxpool_indices[i]
                         batch_indices = torch.arange(current_batch_size).view(-1, 1, 1, 1).to(self.device)
                         channel_indices = torch.arange(pool.shape[1]).view(1, -1, 1, 1).to(self.device)
-                        row_indices = (pool // B.shape[2]).to(self.device)
+                        row_indices = (pool // B.shape[3]).to(self.device)  # Fixed bug in original code (was B.shape[2])
                         col_indices = (pool % B.shape[3]).to(self.device)
+                        B = B[batch_indices, channel_indices, row_indices, col_indices]
+                    elif isinstance(layer, nn.MaxPool1d):
+                        pool = self.model.maxpool_indices[i]
+                        batch_indices = torch.arange(current_batch_size).view(-1, 1, 1, 1).to(self.device)
+                        channel_indices = torch.arange(pool.shape[1]).view(1, -1, 1, 1).to(self.device)
+                        row_indices = torch.zeros_like(pool).to(self.device)
+                        col_indices = pool.to(self.device)
                         B = B[batch_indices, channel_indices, row_indices, col_indices]
 
                 # Cat the vector produced to the matrix M(W,f)(x)
-                A = torch.cat((A, B.T), dim=-1) if A.numel() else B.T
+                A = torch.cat((A, B.transpose(-1, -2)), dim=-1) if A.numel() else B.transpose(-1, -2)
 
             # Process bias and batch norm terms by iterating through layers again
             # Computing activation ratios and applying appropriate transformations
@@ -143,14 +161,14 @@ class KnowledgeMatrixComputer:
                     elif isinstance(layer, (
                     nn.Conv2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.Flatten, nn.Linear)):
                         a = layer(a)
-                    elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
+                    elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveAvgPool2d)):
                         pool = self.model.maxpool_indices[i]
                         batch_indices = torch.arange(pool.shape[0]).view(-1, 1, 1, 1).to(self.device)
                         channel_indices = torch.arange(pool.shape[1]).view(1, -1, 1, 1).to(self.device)
-                        row_indices = pool // a.shape[2]
+                        row_indices = pool // a.shape[3]
                         col_indices = pool % a.shape[3]
                         a = a[batch_indices, channel_indices, row_indices.to(self.device), col_indices.to(self.device)]
 
-                return torch.cat((A, a.T), dim=-1)
+                return torch.cat((A, a.transpose(-1, -2)), dim=-1)
 
             return A

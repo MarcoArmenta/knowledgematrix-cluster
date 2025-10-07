@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typing import Union, Dict, Tuple
+from typing import Union, Tuple
 
 
 class NN(nn.Module):
@@ -25,9 +25,8 @@ class NN(nn.Module):
         self.save = save
         self.device = device
         self.layers = nn.ModuleList()
-        self.residuals: Dict[int, Tuple[int, list[nn.Module]]] = {}
+        self.residuals: nn.ModuleDict()
         self.residuals_starts: set[int] = set()
-
 
     ### Linear Layers ###
 
