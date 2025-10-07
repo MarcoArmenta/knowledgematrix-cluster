@@ -25,14 +25,14 @@ class KnowledgeMatrixComputer:
         self.batch_size = batch_size
         self.layers = model.layers
         self.device = device
-        if len(model.input_shape) == 3:
-            self.in_c, self.in_h, self.in_w = model.input_shape
-            self.input_size = self.in_c*self.in_h*self.in_w
-        elif len(model.input_shape) == 1:
+        if type(model.input_shape) == int:
             self.input_size = 1
             self.in_c = 1
             self.in_h = model.input_shape[0]
             self.in_w = 1
+        elif len(model.input_shape) == 3:
+            self.in_c, self.in_h, self.in_w = model.input_shape
+            self.input_size = self.in_c*self.in_h*self.in_w
         else:
             raise ValueError(f"Non suported shape {model.shape}")
 
