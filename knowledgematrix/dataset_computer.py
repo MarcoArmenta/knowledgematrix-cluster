@@ -42,7 +42,8 @@ class DatasetComputer:
             self,
             data: Iterable,
             output_dir: str,
-            resume: bool = True
+            resume: bool = True,
+            save_to_disk: bool = True
     ) -> None:
         """
             Compute and save knowledge matrices for each sample in data.
@@ -55,20 +56,25 @@ class DatasetComputer:
                     Supports Dataset, Subset, lists, and generators.
                 output_dir (str): Directory where .pt files will be saved.
                 resume (bool): If True, skips samples where sample_{i}.pt already exists.
+                save_to_disk (bool): If True, saves each matrix as a .pt file.
+                    If False, computes matrices without saving (useful for benchmarking).
         """
-        os.makedirs(output_dir, exist_ok=True)
+        if save_to_disk:
+            os.makedirs(output_dir, exist_ok=True)
 
         for i, item in enumerate(data):
-            filename = f"sample_{i}.pt"
-            filepath = os.path.join(output_dir, filename)
+            if save_to_disk:
+                filename = f"sample_{i}.pt"
+                filepath = os.path.join(output_dir, filename)
 
-            if resume and os.path.exists(filepath):
-                logger.info(f"Skipping sample {i} (already exists)")
-                continue
+                if resume and os.path.exists(filepath):
+                    logger.info(f"Skipping sample {i} (already exists)")
+                    continue
 
             x = item[0] if isinstance(item, (tuple, list)) else item
             mat = self._computer.forward(x)
-            torch.save(mat, filepath)
+            if save_to_disk:
+                torch.save(mat, filepath)
             logger.info(f"Computed sample {i}")
 
     def compress(

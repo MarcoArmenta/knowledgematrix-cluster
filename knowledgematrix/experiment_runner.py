@@ -65,7 +65,8 @@ class ExperimentRunner:
             self,
             data: Iterable,
             weight_paths: list[str] | None = None,
-            resume: bool = True
+            resume: bool = True,
+            save_to_disk: bool = True
     ) -> None:
         """
             Run knowledge matrix computation for each weight checkpoint.
@@ -80,6 +81,8 @@ class ExperimentRunner:
                     all weights from get_weight_paths().
                 resume (bool): If True, skips checkpoints that already have matrices.tar.gz,
                     and skips individual samples that are already computed.
+                save_to_disk (bool): If True, saves matrices and compresses them.
+                    If False, computes matrices without saving (useful for benchmarking).
         """
         if weight_paths is None:
             weight_paths = self.get_weight_paths()
@@ -89,7 +92,7 @@ class ExperimentRunner:
             output_dir = os.path.join(self.experiment_dir, "matrices", weight_name)
             archive_path = os.path.join(output_dir, "matrices.tar.gz")
 
-            if resume and os.path.exists(archive_path):
+            if save_to_disk and resume and os.path.exists(archive_path):
                 logger.info(f"Skipping checkpoint {weight_name} (archive already exists)")
                 continue
 
@@ -98,15 +101,17 @@ class ExperimentRunner:
             self.model.load_state_dict(state_dict)
             self.model.eval()
 
-            self._computer.compute(data, output_dir, resume=resume)
-            self._computer.compress(output_dir)
+            self._computer.compute(data, output_dir, resume=resume, save_to_disk=save_to_disk)
+            if save_to_disk:
+                self._computer.compress(output_dir)
             logger.info(f"Completed checkpoint: {weight_name}")
 
     def run_single(
             self,
             data: Iterable,
             weight_path: str,
-            resume: bool = True
+            resume: bool = True,
+            save_to_disk: bool = True
     ) -> None:
         """
             Run knowledge matrix computation for a single weight checkpoint.
@@ -115,5 +120,7 @@ class ExperimentRunner:
                 data: Any iterable yielding tensors or (tensor, label) tuples.
                 weight_path (str): Path to a single .pt weight checkpoint file.
                 resume (bool): If True, skips samples that are already computed.
+                save_to_disk (bool): If True, saves matrices and compresses them.
+                    If False, computes matrices without saving (useful for benchmarking).
         """
-        self.run(data, weight_paths=[weight_path], resume=resume)
+        self.run(data, weight_paths=[weight_path], resume=resume, save_to_disk=save_to_disk)
