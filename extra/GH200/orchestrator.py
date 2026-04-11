@@ -6,6 +6,7 @@
     Configurations are sorted smallest-to-largest so that most runs complete
     before hitting OOM on larger configs. Resume is supported via JSONL dedup.
 """
+from __future__ import annotations
 import argparse
 import os
 import sys

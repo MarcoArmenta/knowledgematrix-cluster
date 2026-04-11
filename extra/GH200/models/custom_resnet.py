@@ -4,6 +4,7 @@
     Generalizes the ResNet-18 pattern from knowledgematrix/models/resnet18.py
     to support arbitrary depth (via blocks_per_stage) and width (via base_width).
 """
+from __future__ import annotations
 from knowledgematrix.neural_net import NN
 
 

@@ -2,6 +2,7 @@
 """
     Parse benchmark results (JSONL) and generate a markdown summary report.
 """
+from __future__ import annotations
 import argparse
 import os
 import sys

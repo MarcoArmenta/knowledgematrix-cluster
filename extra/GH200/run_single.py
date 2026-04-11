@@ -7,6 +7,7 @@
     torch at module level, all knowledgematrix imports are deferred until after
     the RMM/torch setup block.
 """
+from __future__ import annotations
 import argparse
 import json
 import os
