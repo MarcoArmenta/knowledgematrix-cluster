@@ -43,9 +43,9 @@ class KnowledgeMatrixComputer:
         with torch.no_grad():
             # Saves activations and pre-activations
             self.model.save = True
+            self.model.to(self.device)
             self.current_output = self.model.forward(x)
             self.model.save = False
-            self.model.to(self.device)
             start_layer = self.model._get_start_layer()
             for layer in self.model.layers[:start_layer]:
                 x = layer(x)

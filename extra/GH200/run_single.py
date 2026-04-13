@@ -103,6 +103,7 @@ def main() -> None:
             device=device,
         )
         model.eval()  # NN.eval() returns None — standalone call only
+        model.to(device)
         result["model_params"] = sum(p.numel() for p in model.parameters())
 
         # Create computer
