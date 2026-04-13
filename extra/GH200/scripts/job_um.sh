@@ -30,4 +30,7 @@ if [ -f .venv/bin/activate ]; then
     source .venv/bin/activate
 fi
 
-python extra/GH200/orchestrator.py --allocator rmm --resume
+# Flush Python stdout immediately (SLURM has no TTY, so Python block-buffers by default)
+export PYTHONUNBUFFERED=1
+
+python -u extra/GH200/orchestrator.py --allocator rmm --resume

@@ -50,11 +50,19 @@ Total: 3,888 configurations per allocator.
 
 Once you are on your GH200:
 
+**Important:** All GPU workloads must be submitted via `sbatch` (or `srun` for
+short interactive tasks). Never run benchmarks directly with `bash` or `python`
+on the login node.
+
 ### 1. Setup
+
+Run the setup script via `salloc` to get an interactive allocation:
 
 ```bash
 cd /path/to/knowledgematrix
+salloc --partition=<your-gh200-partition> --gres=gpu:1 --mem=32G --time=01:00:00
 bash extra/GH200/scripts/phase0_setup.sh
+exit  # release the allocation
 ```
 
 This validates the environment (architecture, page size, GPU, NUMA) and installs
@@ -107,45 +115,35 @@ sbatch extra/GH200/scripts/job_hbm.sh  # picks up where it left off
 
 ### 7. Generate Summary
 
+Submit a short job to generate the summary:
+
 ```bash
-python extra/GH200/summarize.py
+srun --partition=<your-gh200-partition> --gres=gpu:0 --time=00:05:00 \
+    python extra/GH200/summarize.py
 cat extra/GH200/results/summary.md
 ```
 
 ### 8. Optional: Profiling Traces
 
-Edit the SLURM script to add `--enable-profiler`:
+Edit the SLURM script to add `--enable-profiler` to the orchestrator command,
+then resubmit:
 
 ```bash
-python extra/GH200/orchestrator.py --allocator default --resume --enable-profiler
+sbatch extra/GH200/scripts/job_hbm.sh
 ```
 
 View traces in Chrome: open `chrome://tracing` and load files from
 `extra/GH200/results/traces/`.
 
-## Running Locally (CPU, for Testing)
+## Testing Locally (CPU, No GPU Required)
 
-You can test the orchestrator dry-run mode without a GPU:
+You can test the orchestrator dry-run mode on a login node or your local machine:
 
 ```bash
 python extra/GH200/orchestrator.py --allocator default --dry-run
 ```
 
-This prints all 1,944 configurations without launching subprocesses.
-
-To test a single small configuration:
-
-```bash
-python extra/GH200/run_single.py \
-    --base-width 128 \
-    --blocks-per-stage '[2,2,2,2]' \
-    --input-size 3,32,32 \
-    --column-batch-size 16 \
-    --num-samples 2 \
-    --num-classes 10 \
-    --allocator default \
-    --results-path extra/GH200/results/test.jsonl
-```
+This prints all 1,944 configurations without launching subprocesses or using the GPU.
 
 ## Results Format
 

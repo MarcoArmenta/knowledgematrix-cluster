@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime, timezone
 
 # Ensure project root is on path
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -69,8 +70,8 @@ def main() -> None:
                         help="Skip already-completed configs (default: True)")
     parser.add_argument("--no-resume", action="store_false", dest="resume",
                         help="Re-run all configs from scratch")
-    parser.add_argument("--timeout", type=int, default=3600,
-                        help="Per-config subprocess timeout in seconds (default: 3600)")
+    parser.add_argument("--timeout", type=int, default=900,
+                        help="Per-config subprocess timeout in seconds (default: 900)")
     parser.add_argument("--enable-profiler", action="store_true",
                         help="Run torch.profiler trace for each config")
     args = parser.parse_args()
@@ -80,8 +81,10 @@ def main() -> None:
 
     configs = generate_configs(args.allocator)
     total = len(configs)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Orchestrator started")
     print(f"Allocator: {args.allocator}")
     print(f"Total configurations: {total}")
+    sys.stdout.flush()
 
     if args.dry_run:
         print(f"\n--- DRY RUN (no subprocesses will be launched) ---\n")
@@ -108,9 +111,11 @@ def main() -> None:
 
     print()
     print_header()
+    sys.stdout.flush()
 
     done = 0
     skipped = 0
+    remaining = total - len(completed_keys)
     for i, cfg in enumerate(configs):
         key = config_key(cfg)
         if key in completed_keys:
@@ -125,9 +130,12 @@ def main() -> None:
             enable_profiler=args.enable_profiler,
         )
         done += 1
+        print(f"[{done}/{remaining}] ", end="")
         print_result_row(result)
+        sys.stdout.flush()
 
     print(f"\nDone: {done} run, {skipped} skipped, {total} total")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

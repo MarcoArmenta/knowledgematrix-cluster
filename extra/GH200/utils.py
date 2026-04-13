@@ -74,8 +74,8 @@ def now_iso() -> str:
 def run_benchmark_subprocess(
     config: dict,
     results_path: str,
-    timeout: int,
     project_root: str,
+    timeout: int = 900,
     enable_profiler: bool = False,
 ) -> dict:
     """

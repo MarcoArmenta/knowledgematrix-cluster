@@ -37,9 +37,9 @@ INPUT_SIZES: list[tuple[int, int, int]] = [
     (3, 128, 128),
 ]
 
-COLUMN_BATCH_SIZES: list[int] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+COLUMN_BATCH_SIZES: list[int] = [16, 64, 256, 1024, 4096]
 
-NUM_SAMPLES: list[int] = [10, 100, 1000, 10000]
+NUM_SAMPLES: list[int] = [10, 100, 1000]
 
 NUM_CLASSES_LIST: list[int] = [10, 100, 1000]
 
