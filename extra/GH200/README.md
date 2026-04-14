@@ -59,7 +59,7 @@ on the login node.
 Run the setup script via `salloc` to get an interactive allocation:
 
 ```bash
-cd /path/to/knowledgematrix
+cd /path/to/knowledgematrix   # your project root
 salloc --partition=<your-gh200-partition> --gres=gpu:1 --mem=32G --time=01:00:00
 bash extra/GH200/scripts/phase0_setup.sh
 exit  # release the allocation
@@ -73,13 +73,14 @@ dependencies (PyTorch with CUDA for ARM64, RMM, knowledgematrix).
 Edit the SLURM scripts to match your cluster:
 
 ```bash
-# Set your partition and project path in both scripts:
+# Set your partition in both scripts:
 vim extra/GH200/scripts/job_hbm.sh
 vim extra/GH200/scripts/job_um.sh
 ```
 
-Replace `<your-gh200-partition>` with your GH200 partition name and
-`/path/to/knowledgematrix` with the actual project path.
+Replace `<your-gh200-partition>` with your GH200 partition name.
+The working directory is detected automatically via `SLURM_SUBMIT_DIR` —
+just submit from the project root.
 
 ### 3. Run HBM Benchmark
 
@@ -216,3 +217,104 @@ extra/GH200/
     ├── summary.md              # Summary tables (generated)
     └── traces/                 # torch.profiler Chrome traces (generated)
 ```
+
+## Preliminary Results
+
+> Benchmarks in progress. Only R18-w128 and partial R18-w256 results available so far.
+> R34/R46 models pending.
+
+**Hardware:** NVIDIA GH200 144G HBM3e (node gh1305.m)
+**Dates:** 2026-04-13 (HBM), 2026-04-14 (Unified Memory)
+
+### Best Achievable Latency
+
+Best median time per knowledge matrix across all class counts and column batch sizes tested.
+
+| Model | Input | HBM ms | ColBatch | HBM Peak GB | UM ms | ColBatch | UM Peak GB |
+|-------|-------|-------:|:--------:|------------:|------:|:--------:|-----------:|
+| R18-w128 | 3x32x32 | 75 | 4096 | 9.3 | 76 | 4096 | 1.3 |
+| R18-w128 | 3x64x64 | 372 | 4096 | 35.7 | 372 | 4096 | 1.3 |
+| R18-w128 | 3x128x128 | 5,760 | 1024 | 35.8 | 5,760 | 1024 | 1.35 |
+| R18-w256 | 3x32x32 | 218 | 1024 | 9.4 | -- | -- | -- |
+| R18-w256 | 3x64x64 | 1,012 | 1024 | 18.4 | -- | -- | -- |
+| R18-w256 | 3x128x128 | 16,728 | 64 | 5.3 | -- | -- | -- |
+
+R18-w128 3x128x128 at colbatch=4096 hits OOM on HBM (would need ~142 GB).
+R18-w256 3x128x128 only has colbatch 16 and 64 results so far.
+
+### Column Batch Scaling — R18-w128
+
+Median ms per matrix (1000 classes, 10 samples). Shows how increasing column batch
+size trades memory for speed.
+
+| ColBatch | 3x32x32 HBM | 3x32x32 UM | 3x64x64 HBM | 3x64x64 UM | 3x128x128 HBM | 3x128x128 UM |
+|:--------:|------------:|----------:|------------:|-----------:|--------------:|--------------:|
+| 16 | 595 | 730 | 2,484 | 2,838 | 10,882 | 11,622 |
+| 64 | 161 | 191 | 638 | 775 | 6,923 | 6,938 |
+| 256 | 91 | 92 | 435 | 435 | 5,930 | 5,934 |
+| 1024 | 78 | 79 | 379 | 380 | 5,765 | 5,779 |
+| 4096 | 76 | 76 | 373 | 373 | OOM | 41,121 |
+
+### Column Batch Scaling — R18-w256
+
+Median ms per matrix (1000 classes, 10 samples). HBM only (UM data pending).
+
+| ColBatch | 3x32x32 | 3x64x64 | 3x128x128 |
+|:--------:|--------:|--------:|----------:|
+| 16 | 606 | 2,584 | -- |
+| 64 | 326 | 1,452 | -- |
+| 256 | 232 | 1,071 | -- |
+| 1024 | 219 | 1,012 | -- |
+| 4096 | 219 | 1,020 | -- |
+
+R18-w256 latency saturates at colbatch=1024 — no benefit from 4096, which uses 4x
+more memory (18.8 vs 71.5 GB at 3x64x64).
+
+### Memory: HBM vs Unified Memory
+
+Peak GPU memory (GB) for R18-w128 at 3x64x64, 1000 classes.
+HBM grows linearly with column batch; UM stays flat.
+
+| ColBatch | HBM Peak GB | UM Peak GB |
+|:--------:|------------:|-----------:|
+| 16 | 0.41 | 1.34 |
+| 64 | 0.83 | 1.34 |
+| 256 | 2.49 | 1.36 |
+| 1024 | 9.13 | 1.36 |
+| 4096 | 35.71 | 1.35 |
+
+UM reports a constant ~1.3 GB because RMM's managed pool backs allocations with
+unified memory that spills transparently between HBM and LPDDR5X. The actual
+working set is larger but not reflected in `torch.cuda.max_memory_allocated`.
+
+### Failures
+
+| Failure | Conditions |
+|---------|------------|
+| Timeout (>30s) | ColBatch=16 with 1000 samples at 64x64+ inputs; most 128x128 configs with >=100 samples |
+| OOM | R18-w128 3x128x128 at colbatch=4096 (HBM only, needs ~142 GB) |
+| UM page thrashing | R18-w128 3x128x128 at colbatch=4096 — 41s vs 5.8s at 1024 (~7x regression) |
+| Not tested | R18-w256 3x128x128 at colbatch >=256; all R34/R46 models |
+
+### Key Findings
+
+- **Input size dominates latency.** Going from 32x32 to 128x128 increases compute
+  time ~75x for the same model and column batch.
+- **ColBatch 16→256 gives 6-8x speedup.** Beyond 256 the returns diminish sharply;
+  1024→4096 gives <2% improvement for R18-w128 and 0% for R18-w256.
+- **Number of classes has negligible effect on latency** (<3% variation across
+  10/100/1000 classes at the same colbatch).
+- **Number of samples does not affect per-sample latency** — medians are stable across
+  10, 100, and 1000 samples (as expected for independent computations).
+- **Unified memory matches HBM latency** at colbatch >=256 (within 1%) for inputs
+  up to 128x128, but is 15-20% slower at colbatch=16 and =64.
+- **Unified memory keeps peak memory flat at ~1.3 GB** regardless of column batch,
+  versus up to 71.5 GB for HBM. This enables larger models/inputs that would
+  otherwise OOM.
+- **UM page thrashing at large working sets:** colbatch=4096 at 3x128x128 is ~7x
+  slower than colbatch=1024 (41s vs 5.8s) due to page migration overhead between
+  HBM and LPDDR5X. Use colbatch=1024 for large inputs with unified memory.
+- **Recommended colbatch for R18-w128:** 1024 (best speed/memory tradeoff —
+  within 2% of maximum speed at 4x less memory than 4096).
+- **Recommended colbatch for R18-w256:** 1024 (latency saturates here; 4096 wastes
+  memory with no speed gain).
