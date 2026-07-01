@@ -321,3 +321,30 @@ Findings from adding regularization + scheduler search + mid-training best:
   hit directly. For a stiff, sensitive objective like KM, a controlled sweep beats sparse
   random search. None of this changes the headline: **vanilla still wins every case**, and
   tuning/regularization mostly help KM catch up rather than overtake.
+
+#### Generalization gap (regularized HPO, mid-training best vs final)
+
+Gap = train − test measured *at the same checkpoint* (per-trial gaps for all 28 configs
+are in `results_reg.md`). At the winning configs:
+
+| family | loss | best test | **best-ckpt gap** | final test | final gap |
+|--------|------|-----------|-------------------|------------|-----------|
+| MLP | off-class KM | 0.46 | **0.20** | 0.48 | 0.19 |
+| MLP | vanilla CE   | 0.64 (ep 16) | **0.35** | 0.63 | 0.37 |
+| CNN | off-class KM | 0.56 | **0.07** | 0.56 | 0.07 |
+| CNN | vanilla CE   | 0.94 | **0.06** | 0.94 | 0.06 |
+
+- **At matched architecture the KM gap is systematically smaller than vanilla's** — on the
+  MLP trials KM gaps are mostly 0.00–0.15 while vanilla's are 0.10–0.40 (e.g. one config:
+  KM 0.01 vs vanilla 0.37; another: KM 0.15 vs vanilla 0.40). Same story as before: KM's
+  tighter gap is *underfitting* (lower train **and** lower test), not better transfer.
+- **On CNNs both gaps are small** (~0.06): vanilla because it sits near the accuracy ceiling
+  (test ≈ 0.94, train ≈ 1.0), KM because it underfits. So a small gap means opposite things
+  for the two losses.
+- **Mid-training best (early stopping) shrinks the gap — mostly for vanilla.** Selecting the
+  best-val checkpoint instead of the final epoch reduces vanilla's gap in most trials (up to
+  0.43 → 0.29) and often lifts its test, because the peak precedes full memorization (the MLP
+  winner peaks at **epoch 16**). KM's best-ckpt ≈ final gap — its instability is late *collapse*,
+  not gradual overfitting, so early stopping rescues accuracy without changing the gap much.
+- **Negative gaps** appear for a few KM runs (test ≥ train) — these are the lr-collapsed configs
+  sitting at chance, i.e. no fitting at all.

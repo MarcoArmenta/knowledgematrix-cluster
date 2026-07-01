@@ -44,12 +44,47 @@ Both losses share architecture + init per config. Selection is by the **best-by-
 
 ## Best configuration in every case (selected by mid-training best val)
 
-| family | loss | best config | best epoch | val | **best test** | final test |
-|--------|------|-------------|-----------|-----|---------------|------------|
-| MLP | off-class KM | MLP d=2 w=512 lr=0.3 bs=64 wd=0 sched=step | 74 | 0.546 | **0.462** | 0.484 |
-| MLP | vanilla CE | MLP d=1 w=512 lr=0.3 bs=128 wd=1e-05 sched=plateau | 16 | 0.668 | **0.644** | 0.630 |
-| CNN | off-class KM | CNN d=3 ch=(32, 64, 128) k=3 lr=0.01 bs=64 wd=1e-05 sched=onecycle | 97 | 0.584 | **0.557** | 0.556 |
-| CNN | vanilla CE | CNN d=2 ch=(32, 64) k=5 lr=0.03 bs=64 wd=0 sched=plateau | 36 | 0.966 | **0.938** | 0.938 |
+Gaps are train − test at the *same* checkpoint: `best gap` at the best-val checkpoint, `final gap` at the last epoch.
+
+| family | loss | best config | best epoch | **best test** | best gap | final test | final gap |
+|--------|------|-------------|-----------|---------------|----------|------------|-----------|
+| MLP | off-class KM | MLP d=2 w=512 lr=0.3 bs=64 wd=0 sched=step | 74 | **0.462** | 0.201 | 0.484 | 0.188 |
+| MLP | vanilla CE | MLP d=1 w=512 lr=0.3 bs=128 wd=1e-05 sched=plateau | 16 | **0.644** | 0.349 | 0.630 | 0.370 |
+| CNN | off-class KM | CNN d=3 ch=(32, 64, 128) k=3 lr=0.01 bs=64 wd=1e-05 sched=onecycle | 97 | **0.557** | 0.069 | 0.556 | 0.068 |
+| CNN | vanilla CE | CNN d=2 ch=(32, 64) k=5 lr=0.03 bs=64 wd=0 sched=plateau | 36 | **0.938** | 0.061 | 0.938 | 0.062 |
+
+## Generalization gap: best-checkpoint vs final for every trial
+
+| family | # | KM best gap | KM final gap | van best gap | van final gap |
+|--------|---|-------------|--------------|--------------|---------------|
+| MLP | 1 | 0.024 | 0.012 | 0.040 | 0.043 |
+| MLP | 2 | -0.004 | -0.004 | 0.118 | 0.139 |
+| MLP | 3 | 0.024 | -0.002 | 0.087 | 0.107 |
+| MLP | 4 | 0.057 | 0.062 | 0.081 | 0.080 |
+| MLP | 5 | 0.111 | 0.108 | 0.155 | 0.163 |
+| MLP | 6 | 0.009 | -0.004 | 0.120 | 0.118 |
+| MLP | 7 | 0.123 | 0.142 | 0.212 | 0.236 |
+| MLP | 8 | -0.004 | -0.004 | 0.349 | 0.370 |
+| MLP | 9 | 0.039 | 0.043 | 0.102 | 0.135 |
+| MLP | 10 | 0.201 | 0.188 | 0.239 | 0.275 |
+| MLP | 11 | 0.009 | 0.020 | 0.366 | 0.377 |
+| MLP | 12 | 0.091 | 0.148 | 0.294 | 0.430 |
+| MLP | 13 | 0.079 | 0.074 | 0.068 | 0.070 |
+| MLP | 14 | 0.148 | 0.109 | 0.349 | 0.375 |
+| MLP | 15 | 0.150 | 0.166 | 0.401 | 0.397 |
+| MLP | 16 | 0.042 | 0.046 | 0.073 | 0.071 |
+| CNN | 1 | -0.004 | -0.004 | 0.033 | 0.033 |
+| CNN | 2 | 0.014 | -0.004 | 0.030 | 0.039 |
+| CNN | 3 | 0.055 | 0.069 | 0.061 | 0.062 |
+| CNN | 4 | 0.041 | 0.035 | 0.066 | 0.083 |
+| CNN | 5 | 0.010 | 0.016 | 0.018 | 0.018 |
+| CNN | 6 | 0.069 | 0.068 | 0.065 | 0.063 |
+| CNN | 7 | 0.061 | 0.022 | 0.052 | 0.066 |
+| CNN | 8 | 0.028 | 0.022 | 0.051 | 0.059 |
+| CNN | 9 | -0.005 | 0.005 | 0.000 | 0.005 |
+| CNN | 10 | 0.001 | -0.006 | 0.025 | 0.039 |
+| CNN | 11 | 0.037 | 0.034 | 0.036 | 0.041 |
+| CNN | 12 | 0.054 | 0.050 | 0.053 | 0.057 |
 
 ## Which LR scheduler is best (mean best-test over its trials)
 

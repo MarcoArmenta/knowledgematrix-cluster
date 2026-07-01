@@ -125,6 +125,7 @@ def main():
     families = [("MLP", sample_mlp, args.mlp_trials), ("CNN", sample_cnn, args.cnn_trials)]
     best = {}
     sched_scores = {}   # (family, loss, scheduler) -> list of best-val test
+    trials_by_fam = {}
 
     for fam, sampler, n_trials in families:
         log(f"## {fam}: {n_trials} random configurations\n")
@@ -143,22 +144,37 @@ def main():
                 sched_scores.setdefault((fam, loss, cfg["scheduler"]), []).append(res[loss]["best"]["test"])
             print(f"    (trial {t+1}/{n_trials} {cfg['scheduler']} took {time.time()-t0:.0f}s)", flush=True)
 
+        trials_by_fam[fam] = trials
         for loss in LOSSES:
             cfg, res = max(trials, key=lambda cr: cr[1][loss]["best"]["val"])
-            b = res[loss]["best"]
-            best[(fam, loss)] = (cfg, b["epoch"], b["val"], b["test"],
-                                 res[loss]["final"]["test"], res[loss]["final"]["train"])
+            best[(fam, loss)] = (cfg, res[loss])
         log("")
 
     log("## Best configuration in every case (selected by mid-training best val)\n")
-    log("| family | loss | best config | best epoch | val | **best test** | final test |")
-    log("|--------|------|-------------|-----------|-----|---------------|------------|")
+    log("Gaps are train − test at the *same* checkpoint: `best gap` at the best-val "
+        "checkpoint, `final gap` at the last epoch.\n")
+    log("| family | loss | best config | best epoch | **best test** | best gap | final test | final gap |")
+    log("|--------|------|-------------|-----------|---------------|----------|------------|-----------|")
     pretty = {"km_offclass": "off-class KM", "vanilla": "vanilla CE"}
     for fam, _, _ in families:
         for loss in LOSSES:
-            cfg, ep, vl, te, fte, ftr = best[(fam, loss)]
-            log(f"| {fam} | {pretty[loss]} | {cfg_str(cfg)} | {ep} | {vl:.3f} | "
-                f"**{te:.3f}** | {fte:.3f} |")
+            cfg, r = best[(fam, loss)]
+            b, f = r["best"], r["final"]
+            best_gap = b["train"] - b["test"]
+            final_gap = f["train"] - f["test"]
+            log(f"| {fam} | {pretty[loss]} | {cfg_str(cfg)} | {b['epoch']} | "
+                f"**{b['test']:.3f}** | {best_gap:.3f} | {f['test']:.3f} | {final_gap:.3f} |")
+
+    log("\n## Generalization gap: best-checkpoint vs final for every trial\n")
+    log("| family | # | KM best gap | KM final gap | van best gap | van final gap |")
+    log("|--------|---|-------------|--------------|--------------|---------------|")
+    for fam, all_trials in trials_by_fam.items():
+        for i, (cfg, res) in enumerate(all_trials, 1):
+            km, va = res["km_offclass"], res["vanilla"]
+            log(f"| {fam} | {i} | {km['best']['train'] - km['best']['test']:.3f} "
+                f"| {km['final']['train'] - km['final']['test']:.3f} "
+                f"| {va['best']['train'] - va['best']['test']:.3f} "
+                f"| {va['final']['train'] - va['final']['test']:.3f} |")
 
     log("\n## Which LR scheduler is best (mean best-test over its trials)\n")
     log("| family | loss | " + " | ".join(SCHEDULERS) + " |")

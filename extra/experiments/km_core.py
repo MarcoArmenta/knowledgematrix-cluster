@@ -344,7 +344,7 @@ def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
     g = torch.Generator().manual_seed(seed)
 
     history = []
-    best = {"epoch": 0, "val": -1.0, "test": 0.0}
+    best = {"epoch": 0, "val": -1.0, "test": 0.0, "train": 0.0}
     for epoch in range(1, epochs + 1):
         model.train()
         perm = torch.randperm(n, generator=g)
@@ -363,11 +363,12 @@ def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
         val_acc = None
         if eval_data is not None and (epoch % eval_every == 0 or epoch == epochs):
             xval, yval, xte, yte = eval_data
+            train_acc = accuracy(model, x_tr, y_tr)
             val_acc = accuracy(model, xval, yval)
             test_acc = accuracy(model, xte, yte)
-            history.append((epoch, val_acc, test_acc))
+            history.append((epoch, train_acc, val_acc, test_acc))
             if val_acc > best["val"]:
-                best = {"epoch": epoch, "val": val_acc, "test": test_acc}
+                best = {"epoch": epoch, "val": val_acc, "test": test_acc, "train": train_acc}
 
         if sched is not None:
             if needs_metric:
