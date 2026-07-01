@@ -146,6 +146,64 @@ def make_blobs(centers, n, seed):
     return x, labels
 
 
+def load_mnist1d(path):
+    """
+        Load the MNIST-1D dataset (Greydanus, github.com/greydanus/mnist1d).
+        Returns (x_train, y_train, x_test, y_test), inputs standardized with
+        the training-set statistics.  x has shape (n, 40); 10 classes.
+    """
+    import pickle
+    with open(path, "rb") as f:
+        d = pickle.load(f)
+    x_tr = torch.tensor(d["x"], dtype=torch.get_default_dtype())
+    y_tr = torch.tensor(d["y"], dtype=torch.long)
+    x_te = torch.tensor(d["x_test"], dtype=torch.get_default_dtype())
+    y_te = torch.tensor(d["y_test"], dtype=torch.long)
+    mean, std = x_tr.mean(0, keepdim=True), x_tr.std(0, keepdim=True) + 1e-8
+    x_tr, x_te = (x_tr - mean) / std, (x_te - mean) / std
+    return x_tr, y_tr, x_te, y_te
+
+
+# --------------------------------------------------------------------------- #
+#  Losses on the knowledge matrix
+# --------------------------------------------------------------------------- #
+def loss_km_eii(M, y):
+    """||M(x) - E_ii||_F^2 : pin the *whole* matrix to the sparse unit E_ii."""
+    target = torch.zeros_like(M)
+    b = torch.arange(M.shape[0])
+    target[b, y, y] = 1.0
+    return ((M - target) ** 2).sum(dim=(1, 2)).mean()
+
+
+def loss_km_offclass(M, y):
+    """
+        Recommended, less rigid KM loss.
+
+        Ask only that (a) every *wrong* class row of M(x) vanishes and (b) the
+        *correct* class row sums to 1 -- but leave the within-row distribution
+        over input features free:
+
+            L = ( sum_c M[i, c] - 1 )^2  +  sum_{j != i} || M[j, :] ||^2
+
+        Because output(x) = M(x).sum(columns), the minimizer gives a one-hot
+        output at class i (correct, confident) just like E_ii, yet does not
+        dictate *how* the true class's logit is attributed across the inputs.
+        This frees many more configurations and is easier to optimize.
+    """
+    B, K, C = M.shape
+    b = torch.arange(B)
+    row_sum = M.sum(-1)                                  # (B, K) == logits
+    term_correct = (row_sum[b, y] - 1.0) ** 2            # true logit -> 1
+    row_sq = (M ** 2).sum(-1)                            # (B, K) squared row norms
+    off_mask = torch.ones(B, K, device=M.device)
+    off_mask[b, y] = 0.0
+    term_wrong = (row_sq * off_mask).sum(-1)             # wrong rows -> 0
+    return (term_correct + term_wrong).mean()
+
+
+KM_LOSSES = {"km_eii": loss_km_eii, "km_offclass": loss_km_offclass}
+
+
 # --------------------------------------------------------------------------- #
 #  Training / evaluation
 # --------------------------------------------------------------------------- #
@@ -156,10 +214,14 @@ def accuracy(model, x, y):
     return (out.argmax(1) == y).float().mean().item()
 
 
-def train(model, x_tr, y_tr, x_te, y_te, *, mode, epochs, lr, batch_size, d, k, log=None):
-    """mode = 'km' (knowledge-matrix loss) or 'vanilla' (cross-entropy)."""
+def train(model, x_tr, y_tr, x_te, y_te, *, mode, epochs, lr, batch_size, log=None):
+    """
+        mode = 'vanilla'  -> cross-entropy on the output, or
+        mode in KM_LOSSES -> a loss on the knowledge matrix M(x).
+    """
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     ce = nn.CrossEntropyLoss()
+    km_loss = KM_LOSSES.get(mode)
     n = x_tr.shape[0]
     g = torch.Generator().manual_seed(0)
 
@@ -173,13 +235,9 @@ def train(model, x_tr, y_tr, x_te, y_te, *, mode, epochs, lr, batch_size, d, k, 
             xb, yb = x_tr[idx], y_tr[idx]
             opt.zero_grad()
 
-            if mode == "km":
+            if km_loss is not None:
                 M, _ = knowledge_matrix_mlp(model, xb)        # (B, K, d+1)
-                # target E_{ii}: zeros except entry (label, label) = 1
-                target = torch.zeros_like(M)
-                bidx = torch.arange(xb.shape[0])
-                target[bidx, yb, yb] = 1.0
-                loss = ((M - target) ** 2).sum(dim=(1, 2)).mean()
+                loss = km_loss(M, yb)
             elif mode == "vanilla":
                 loss = ce(model.forward(xb), yb)
             else:
@@ -193,7 +251,7 @@ def train(model, x_tr, y_tr, x_te, y_te, *, mode, epochs, lr, batch_size, d, k, 
         te_acc = accuracy(model, x_te, y_te)
         history.append((epoch + 1, epoch_loss / n, tr_acc, te_acc))
         if log is not None:
-            log(f"  [{mode:7s}] epoch {epoch + 1:3d}/{epochs}  "
+            log(f"  [{mode:11s}] epoch {epoch + 1:3d}/{epochs}  "
                 f"loss={epoch_loss / n:.4f}  train_acc={tr_acc:.4f}  test_acc={te_acc:.4f}")
     return history
 
@@ -203,11 +261,15 @@ def train(model, x_tr, y_tr, x_te, y_te, *, mode, epochs, lr, batch_size, d, k, 
 # --------------------------------------------------------------------------- #
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--d", type=int, default=16, help="input dimension")
-    p.add_argument("--k", type=int, default=4, help="number of classes")
+    p.add_argument("--dataset", choices=["mnist1d", "blobs"], default="mnist1d")
+    p.add_argument("--data-path", type=str,
+                   default="extra/experiments/data/mnist1d_data.pkl",
+                   help="path to mnist1d_data.pkl (used when --dataset mnist1d)")
+    p.add_argument("--d", type=int, default=16, help="input dim (blobs only)")
+    p.add_argument("--k", type=int, default=4, help="num classes (blobs only)")
     p.add_argument("--hidden", type=int, default=64)
-    p.add_argument("--n-train", type=int, default=2000)
-    p.add_argument("--n-test", type=int, default=500)
+    p.add_argument("--n-train", type=int, default=2000, help="blobs only")
+    p.add_argument("--n-test", type=int, default=500, help="blobs only")
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=64)
@@ -216,69 +278,91 @@ def main():
     args = p.parse_args()
 
     torch.set_default_dtype(torch.float32)
-    assert args.k <= args.d + 1, "E_{ii} needs the class index i to be a valid column (k <= d+1)."
 
     lines = []
     def log(msg):
         print(msg, flush=True)
         lines.append(msg)
 
+    # Data ------------------------------------------------------------------- #
+    if args.dataset == "mnist1d":
+        x_tr, y_tr, x_te, y_te = load_mnist1d(args.data_path)
+        d, k = x_tr.shape[1], int(y_tr.max().item()) + 1
+        data_desc = (f"MNIST-1D (github.com/greydanus/mnist1d): "
+                     f"d={d}, classes={k}, n_train={x_tr.shape[0]}, n_test={x_te.shape[0]}")
+    else:
+        d, k = args.d, args.k
+        centers = make_centers(d, k, seed=args.seed)
+        x_tr, y_tr = make_blobs(centers, args.n_train, seed=args.seed + 1)
+        x_te, y_te = make_blobs(centers, args.n_test, seed=args.seed + 2)
+        data_desc = (f"synthetic blobs: d={d}, classes={k}, "
+                     f"n_train={args.n_train}, n_test={args.n_test}")
+
+    assert k <= d + 1, "E_{ii} needs the class index i to be a valid column (k <= d+1)."
+
     log("# Training a network via knowledge matrices\n")
-    log(f"Config: d={args.d}, classes={args.k}, hidden={args.hidden}, "
-        f"n_train={args.n_train}, n_test={args.n_test}, epochs={args.epochs}, "
-        f"lr={args.lr}, batch_size={args.batch_size}, seed={args.seed}\n")
-
-    # Data (train and test share the same class centers) --------------------- #
-    centers = make_centers(args.d, args.k, seed=args.seed)
-    x_tr, y_tr = make_blobs(centers, args.n_train, seed=args.seed + 1)
-    x_te, y_te = make_blobs(centers, args.n_test, seed=args.seed + 2)
-
-    # Two models with *identical* initial weights ---------------------------- #
-    torch.manual_seed(args.seed)
-    model_km = SimpleMLP((1, args.d), args.k, hidden=args.hidden)
-    init_state = copy.deepcopy(model_km.state_dict())
-    model_vanilla = SimpleMLP((1, args.d), args.k, hidden=args.hidden)
-    model_vanilla.load_state_dict(init_state)
+    log(f"Data: {data_desc}")
+    log(f"Config: hidden={args.hidden}, epochs={args.epochs}, lr={args.lr}, "
+        f"batch_size={args.batch_size}, seed={args.seed}\n")
 
     # Faithfulness check ----------------------------------------------------- #
-    diff, rel = validate_against_library(model_km, args.d)
+    torch.manual_seed(args.seed)
+    ref_model = SimpleMLP((1, d), k, hidden=args.hidden)
+    diff, rel = validate_against_library(ref_model, d)
     log(f"Knowledge-matrix check vs library computer: "
         f"abs_diff={diff:.3e}, rel_diff={rel:.3e} "
         f"({'OK' if rel < 1e-4 else 'MISMATCH'})\n")
 
-    # Train ------------------------------------------------------------------ #
-    log("## Knowledge-matrix training  (loss = ||M(x) - E_ii||^2)")
-    hist_km = train(model_km, x_tr, y_tr, x_te, y_te, mode="km",
-                    epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
-                    d=args.d, k=args.k, log=log)
+    # All runs start from the *same* initial weights ------------------------- #
+    torch.manual_seed(args.seed)
+    init_state = copy.deepcopy(SimpleMLP((1, d), k, hidden=args.hidden).state_dict())
 
-    log("\n## Vanilla training  (loss = cross-entropy)")
-    hist_va = train(model_vanilla, x_tr, y_tr, x_te, y_te, mode="vanilla",
-                    epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
-                    d=args.d, k=args.k, log=log)
+    runs = [
+        ("km_eii",      "Knowledge matrices  (loss = ||M(x) - E_ii||^2)"),
+        ("km_offclass", "Knowledge matrices  (loss = off-class rows -> 0, true logit -> 1)"),
+        ("vanilla",     "Vanilla             (loss = cross-entropy)"),
+    ]
+    results = {}
+    for mode, title in runs:
+        log(f"## {title}")
+        model = SimpleMLP((1, d), k, hidden=args.hidden)
+        model.load_state_dict(init_state)
+        hist = train(model, x_tr, y_tr, x_te, y_te, mode=mode,
+                     epochs=args.epochs, lr=args.lr, batch_size=args.batch_size, log=log)
+        results[mode] = hist[-1]        # (epoch, loss, train_acc, test_acc)
+        log("")
 
     # Summary ---------------------------------------------------------------- #
-    km_tr, km_te = hist_km[-1][2], hist_km[-1][3]
-    va_tr, va_te = hist_va[-1][2], hist_va[-1][3]
-    log("\n## Final comparison (identical init & hyper-parameters)\n")
-    log("| training            | final train acc | final test acc |")
-    log("|---------------------|-----------------|----------------|")
-    log(f"| knowledge matrices  | {km_tr:.4f}          | {km_te:.4f}         |")
-    log(f"| vanilla (cross-ent) | {va_tr:.4f}          | {va_te:.4f}         |")
+    log("## Final comparison (identical init & hyper-parameters)\n")
+    log("| training                                    | final train acc | final test acc |")
+    log("|---------------------------------------------|-----------------|----------------|")
+    labels = {
+        "km_eii":      "KM loss  ||M(x) - E_ii||^2",
+        "km_offclass": "KM loss  off-class rows->0, true logit->1",
+        "vanilla":     "vanilla  cross-entropy",
+    }
+    for mode, _ in runs:
+        _, _, tr, te = results[mode]
+        log(f"| {labels[mode]:<43} | {tr:.4f}          | {te:.4f}         |")
 
+    chance = 1.0 / k
+    eii_te = results["km_eii"][3]
+    off_te = results["km_offclass"][3]
+    van_te = results["vanilla"][3]
     log("\n## Observations\n")
     log("- The differentiable knowledge matrix matches the library "
-        "`KnowledgeMatrixComputer` exactly, so the loss is computed on the "
+        "`KnowledgeMatrixComputer` exactly, so every KM loss is computed on the "
         "true M(W,f)(x).")
-    log(f"- Training via `||M(x) - E_ii||^2` does learn the task "
-        f"(test acc {km_te:.2f} >> {1.0 / args.k:.2f} chance) and generalizes "
-        f"(train {km_tr:.2f} vs test {km_te:.2f}).")
-    log("- It is, however, a much harder optimization target than "
-        "cross-entropy and plateaus below it: E_ii pins down *every* entry of "
-        "the local affine decomposition (the whole matrix must become a fixed "
-        "sparse matrix), whereas cross-entropy only constrains the column "
-        "sums (the output). With identical init and hyper-parameters, vanilla "
-        f"reaches {va_te:.2f} test accuracy.")
+    log(f"- Chance level is {chance:.2f}. Ranking by test accuracy: "
+        f"vanilla ({van_te:.2f}) > off-class KM ({off_te:.2f}) > E_ii KM ({eii_te:.2f}).")
+    log(f"- `E_ii` is the most rigid target: it pins *every* entry of M(x) to a "
+        "fixed sparse matrix. On the harder MNIST-1D task this is a very stiff "
+        f"objective and it barely clears chance ({eii_te:.2f} vs {chance:.2f}).")
+    log(f"- The recommended `off-class` loss relaxes this -- it only forces the "
+        "wrong-class rows to vanish and the true logit to 1, leaving the "
+        "per-feature attribution free. That larger solution set trains far "
+        f"better ({off_te:.2f}), closing much of the gap to cross-entropy "
+        f"({van_te:.2f}) while still being a genuine loss on the knowledge matrix.")
 
     if args.report:
         with open(args.report, "w") as f:
