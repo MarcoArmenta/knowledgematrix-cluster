@@ -129,6 +129,130 @@ Knowledge-matrix check vs library computer: abs_diff=0.000e+00, rel_diff=0.000e+
   [km_offclass] epoch  59/60  loss=0.2605  train_acc=0.4717  test_acc=0.4040
   [km_offclass] epoch  60/60  loss=0.2600  train_acc=0.4347  test_acc=0.4020
 
+## Knowledge matrices  (loss = cross-entropy on row norms)
+  [km_rownorm_ce] epoch   1/60  loss=2.2739  train_acc=0.1782  test_acc=0.1940
+  [km_rownorm_ce] epoch   2/60  loss=2.1240  train_acc=0.1875  test_acc=0.2010
+  [km_rownorm_ce] epoch   3/60  loss=1.9245  train_acc=0.2087  test_acc=0.2280
+  [km_rownorm_ce] epoch   4/60  loss=1.7742  train_acc=0.2173  test_acc=0.2320
+  [km_rownorm_ce] epoch   5/60  loss=1.6901  train_acc=0.2215  test_acc=0.2210
+  [km_rownorm_ce] epoch   6/60  loss=1.6270  train_acc=0.2205  test_acc=0.2130
+  [km_rownorm_ce] epoch   7/60  loss=1.5729  train_acc=0.2188  test_acc=0.2230
+  [km_rownorm_ce] epoch   8/60  loss=1.5179  train_acc=0.2227  test_acc=0.2280
+  [km_rownorm_ce] epoch   9/60  loss=1.4723  train_acc=0.2190  test_acc=0.2220
+  [km_rownorm_ce] epoch  10/60  loss=1.4285  train_acc=0.2323  test_acc=0.2410
+  [km_rownorm_ce] epoch  11/60  loss=1.3919  train_acc=0.2215  test_acc=0.2300
+  [km_rownorm_ce] epoch  12/60  loss=1.3547  train_acc=0.2327  test_acc=0.2330
+  [km_rownorm_ce] epoch  13/60  loss=1.3151  train_acc=0.2335  test_acc=0.2240
+  [km_rownorm_ce] epoch  14/60  loss=1.2843  train_acc=0.2345  test_acc=0.2310
+  [km_rownorm_ce] epoch  15/60  loss=1.2483  train_acc=0.2373  test_acc=0.2380
+  [km_rownorm_ce] epoch  16/60  loss=1.2198  train_acc=0.2368  test_acc=0.2330
+  [km_rownorm_ce] epoch  17/60  loss=1.1934  train_acc=0.2380  test_acc=0.2390
+  [km_rownorm_ce] epoch  18/60  loss=1.1687  train_acc=0.2387  test_acc=0.2380
+  [km_rownorm_ce] epoch  19/60  loss=1.1392  train_acc=0.2323  test_acc=0.2280
+  [km_rownorm_ce] epoch  20/60  loss=1.1137  train_acc=0.2325  test_acc=0.2310
+  [km_rownorm_ce] epoch  21/60  loss=1.0935  train_acc=0.2432  test_acc=0.2360
+  [km_rownorm_ce] epoch  22/60  loss=1.0708  train_acc=0.2355  test_acc=0.2370
+  [km_rownorm_ce] epoch  23/60  loss=1.0508  train_acc=0.2428  test_acc=0.2390
+  [km_rownorm_ce] epoch  24/60  loss=1.0330  train_acc=0.2488  test_acc=0.2500
+  [km_rownorm_ce] epoch  25/60  loss=1.0117  train_acc=0.2470  test_acc=0.2460
+  [km_rownorm_ce] epoch  26/60  loss=0.9911  train_acc=0.2415  test_acc=0.2420
+  [km_rownorm_ce] epoch  27/60  loss=0.9808  train_acc=0.2477  test_acc=0.2510
+  [km_rownorm_ce] epoch  28/60  loss=0.9713  train_acc=0.2403  test_acc=0.2310
+  [km_rownorm_ce] epoch  29/60  loss=0.9482  train_acc=0.2407  test_acc=0.2320
+  [km_rownorm_ce] epoch  30/60  loss=0.9365  train_acc=0.2477  test_acc=0.2490
+  [km_rownorm_ce] epoch  31/60  loss=0.9217  train_acc=0.2525  test_acc=0.2510
+  [km_rownorm_ce] epoch  32/60  loss=0.9080  train_acc=0.2535  test_acc=0.2550
+  [km_rownorm_ce] epoch  33/60  loss=0.8958  train_acc=0.2517  test_acc=0.2510
+  [km_rownorm_ce] epoch  34/60  loss=0.8792  train_acc=0.2545  test_acc=0.2600
+  [km_rownorm_ce] epoch  35/60  loss=0.8705  train_acc=0.2540  test_acc=0.2480
+  [km_rownorm_ce] epoch  36/60  loss=0.8621  train_acc=0.2595  test_acc=0.2560
+  [km_rownorm_ce] epoch  37/60  loss=0.8495  train_acc=0.2505  test_acc=0.2450
+  [km_rownorm_ce] epoch  38/60  loss=0.8369  train_acc=0.2540  test_acc=0.2520
+  [km_rownorm_ce] epoch  39/60  loss=0.8252  train_acc=0.2553  test_acc=0.2490
+  [km_rownorm_ce] epoch  40/60  loss=0.8248  train_acc=0.2650  test_acc=0.2590
+  [km_rownorm_ce] epoch  41/60  loss=0.8109  train_acc=0.2623  test_acc=0.2570
+  [km_rownorm_ce] epoch  42/60  loss=0.8117  train_acc=0.2575  test_acc=0.2510
+  [km_rownorm_ce] epoch  43/60  loss=0.7993  train_acc=0.2657  test_acc=0.2600
+  [km_rownorm_ce] epoch  44/60  loss=0.7913  train_acc=0.2600  test_acc=0.2550
+  [km_rownorm_ce] epoch  45/60  loss=0.7824  train_acc=0.2545  test_acc=0.2530
+  [km_rownorm_ce] epoch  46/60  loss=0.7821  train_acc=0.2595  test_acc=0.2550
+  [km_rownorm_ce] epoch  47/60  loss=0.7771  train_acc=0.2605  test_acc=0.2610
+  [km_rownorm_ce] epoch  48/60  loss=0.7684  train_acc=0.2562  test_acc=0.2550
+  [km_rownorm_ce] epoch  49/60  loss=0.7611  train_acc=0.2592  test_acc=0.2580
+  [km_rownorm_ce] epoch  50/60  loss=0.7602  train_acc=0.2520  test_acc=0.2470
+  [km_rownorm_ce] epoch  51/60  loss=0.7510  train_acc=0.2585  test_acc=0.2620
+  [km_rownorm_ce] epoch  52/60  loss=0.7416  train_acc=0.2500  test_acc=0.2490
+  [km_rownorm_ce] epoch  53/60  loss=0.7431  train_acc=0.2668  test_acc=0.2650
+  [km_rownorm_ce] epoch  54/60  loss=0.7294  train_acc=0.2578  test_acc=0.2540
+  [km_rownorm_ce] epoch  55/60  loss=0.7293  train_acc=0.2700  test_acc=0.2690
+  [km_rownorm_ce] epoch  56/60  loss=0.7286  train_acc=0.2607  test_acc=0.2570
+  [km_rownorm_ce] epoch  57/60  loss=0.7151  train_acc=0.2680  test_acc=0.2690
+  [km_rownorm_ce] epoch  58/60  loss=0.7057  train_acc=0.2637  test_acc=0.2670
+  [km_rownorm_ce] epoch  59/60  loss=0.7040  train_acc=0.2612  test_acc=0.2670
+  [km_rownorm_ce] epoch  60/60  loss=0.6984  train_acc=0.2657  test_acc=0.2690
+
+## Knowledge matrices  (loss = margin on row norms)
+  [km_rownorm_margin] epoch   1/60  loss=1.0186  train_acc=0.1245  test_acc=0.1310
+  [km_rownorm_margin] epoch   2/60  loss=1.0016  train_acc=0.1287  test_acc=0.1420
+  [km_rownorm_margin] epoch   3/60  loss=0.9931  train_acc=0.1320  test_acc=0.1270
+  [km_rownorm_margin] epoch   4/60  loss=0.9852  train_acc=0.1295  test_acc=0.1330
+  [km_rownorm_margin] epoch   5/60  loss=0.9759  train_acc=0.1415  test_acc=0.1430
+  [km_rownorm_margin] epoch   6/60  loss=0.9599  train_acc=0.1417  test_acc=0.1490
+  [km_rownorm_margin] epoch   7/60  loss=0.9388  train_acc=0.1447  test_acc=0.1490
+  [km_rownorm_margin] epoch   8/60  loss=0.9092  train_acc=0.1462  test_acc=0.1540
+  [km_rownorm_margin] epoch   9/60  loss=0.8884  train_acc=0.1475  test_acc=0.1470
+  [km_rownorm_margin] epoch  10/60  loss=0.8729  train_acc=0.1520  test_acc=0.1580
+  [km_rownorm_margin] epoch  11/60  loss=0.8627  train_acc=0.1593  test_acc=0.1650
+  [km_rownorm_margin] epoch  12/60  loss=0.8491  train_acc=0.1723  test_acc=0.1740
+  [km_rownorm_margin] epoch  13/60  loss=0.8318  train_acc=0.1787  test_acc=0.1860
+  [km_rownorm_margin] epoch  14/60  loss=0.8219  train_acc=0.1883  test_acc=0.2040
+  [km_rownorm_margin] epoch  15/60  loss=0.8094  train_acc=0.1928  test_acc=0.2070
+  [km_rownorm_margin] epoch  16/60  loss=0.7954  train_acc=0.2000  test_acc=0.2100
+  [km_rownorm_margin] epoch  17/60  loss=0.7866  train_acc=0.2062  test_acc=0.2020
+  [km_rownorm_margin] epoch  18/60  loss=0.7721  train_acc=0.2142  test_acc=0.2120
+  [km_rownorm_margin] epoch  19/60  loss=0.7588  train_acc=0.2065  test_acc=0.2040
+  [km_rownorm_margin] epoch  20/60  loss=0.7446  train_acc=0.2247  test_acc=0.2280
+  [km_rownorm_margin] epoch  21/60  loss=0.7348  train_acc=0.2225  test_acc=0.2260
+  [km_rownorm_margin] epoch  22/60  loss=0.7290  train_acc=0.2132  test_acc=0.2130
+  [km_rownorm_margin] epoch  23/60  loss=0.7246  train_acc=0.2275  test_acc=0.2250
+  [km_rownorm_margin] epoch  24/60  loss=0.7203  train_acc=0.2130  test_acc=0.2310
+  [km_rownorm_margin] epoch  25/60  loss=0.7091  train_acc=0.2240  test_acc=0.2310
+  [km_rownorm_margin] epoch  26/60  loss=0.7053  train_acc=0.2335  test_acc=0.2250
+  [km_rownorm_margin] epoch  27/60  loss=0.6999  train_acc=0.2380  test_acc=0.2420
+  [km_rownorm_margin] epoch  28/60  loss=0.6971  train_acc=0.2163  test_acc=0.2280
+  [km_rownorm_margin] epoch  29/60  loss=0.6914  train_acc=0.2250  test_acc=0.2180
+  [km_rownorm_margin] epoch  30/60  loss=0.6883  train_acc=0.2233  test_acc=0.2140
+  [km_rownorm_margin] epoch  31/60  loss=0.6860  train_acc=0.2323  test_acc=0.2240
+  [km_rownorm_margin] epoch  32/60  loss=0.6837  train_acc=0.2288  test_acc=0.2220
+  [km_rownorm_margin] epoch  33/60  loss=0.6797  train_acc=0.2097  test_acc=0.2110
+  [km_rownorm_margin] epoch  34/60  loss=0.6764  train_acc=0.2175  test_acc=0.2100
+  [km_rownorm_margin] epoch  35/60  loss=0.6742  train_acc=0.2180  test_acc=0.2150
+  [km_rownorm_margin] epoch  36/60  loss=0.6716  train_acc=0.2240  test_acc=0.2310
+  [km_rownorm_margin] epoch  37/60  loss=0.6688  train_acc=0.2095  test_acc=0.1940
+  [km_rownorm_margin] epoch  38/60  loss=0.6637  train_acc=0.1960  test_acc=0.1950
+  [km_rownorm_margin] epoch  39/60  loss=0.6633  train_acc=0.2062  test_acc=0.2070
+  [km_rownorm_margin] epoch  40/60  loss=0.6613  train_acc=0.2023  test_acc=0.2050
+  [km_rownorm_margin] epoch  41/60  loss=0.6545  train_acc=0.1867  test_acc=0.1730
+  [km_rownorm_margin] epoch  42/60  loss=0.6491  train_acc=0.1890  test_acc=0.1840
+  [km_rownorm_margin] epoch  43/60  loss=0.6480  train_acc=0.2093  test_acc=0.2000
+  [km_rownorm_margin] epoch  44/60  loss=0.6450  train_acc=0.2030  test_acc=0.1980
+  [km_rownorm_margin] epoch  45/60  loss=0.6387  train_acc=0.1895  test_acc=0.1800
+  [km_rownorm_margin] epoch  46/60  loss=0.6345  train_acc=0.1743  test_acc=0.1870
+  [km_rownorm_margin] epoch  47/60  loss=0.6336  train_acc=0.1793  test_acc=0.1640
+  [km_rownorm_margin] epoch  48/60  loss=0.6286  train_acc=0.1778  test_acc=0.1850
+  [km_rownorm_margin] epoch  49/60  loss=0.6270  train_acc=0.1657  test_acc=0.1760
+  [km_rownorm_margin] epoch  50/60  loss=0.6237  train_acc=0.1810  test_acc=0.1860
+  [km_rownorm_margin] epoch  51/60  loss=0.6230  train_acc=0.1790  test_acc=0.1780
+  [km_rownorm_margin] epoch  52/60  loss=0.6190  train_acc=0.1695  test_acc=0.1760
+  [km_rownorm_margin] epoch  53/60  loss=0.6147  train_acc=0.1875  test_acc=0.1850
+  [km_rownorm_margin] epoch  54/60  loss=0.6139  train_acc=0.1758  test_acc=0.1700
+  [km_rownorm_margin] epoch  55/60  loss=0.6097  train_acc=0.1793  test_acc=0.1670
+  [km_rownorm_margin] epoch  56/60  loss=0.6084  train_acc=0.1778  test_acc=0.1770
+  [km_rownorm_margin] epoch  57/60  loss=0.6064  train_acc=0.1762  test_acc=0.1760
+  [km_rownorm_margin] epoch  58/60  loss=0.6040  train_acc=0.1745  test_acc=0.1800
+  [km_rownorm_margin] epoch  59/60  loss=0.6024  train_acc=0.1768  test_acc=0.1850
+  [km_rownorm_margin] epoch  60/60  loss=0.6007  train_acc=0.1720  test_acc=0.1720
+
 ## Vanilla             (loss = cross-entropy)
   [vanilla    ] epoch   1/60  loss=2.1496  train_acc=0.2113  test_acc=0.2050
   [vanilla    ] epoch   2/60  loss=1.7857  train_acc=0.3113  test_acc=0.2580
@@ -193,15 +317,18 @@ Knowledge-matrix check vs library computer: abs_diff=0.000e+00, rel_diff=0.000e+
 
 ## Final comparison (identical init & hyper-parameters)
 
-| training                                    | final train acc | final test acc |
-|---------------------------------------------|-----------------|----------------|
-| KM loss  ||M(x) - E_ii||^2                  | 0.1542          | 0.1650         |
-| KM loss  off-class rows->0, true logit->1   | 0.4347          | 0.4020         |
-| vanilla  cross-entropy                      | 0.8052          | 0.5660         |
+| training                                       | final train acc | final test acc |
+|------------------------------------------------|-----------------|----------------|
+| KM loss  ||M(x) - E_ii||^2                     | 0.1542          | 0.1650         |
+| KM loss  off-class rows->0, true logit->1      | 0.4347          | 0.4020         |
+| KM loss  cross-entropy on row norms            | 0.2657          | 0.2690         |
+| KM loss  margin on row norms                   | 0.1720          | 0.1720         |
+| vanilla  cross-entropy                         | 0.8052          | 0.5660         |
 
 ## Observations
 
 - The differentiable knowledge matrix matches the library `KnowledgeMatrixComputer` exactly, so every KM loss is computed on the true M(W,f)(x).
-- Chance level is 0.10. Ranking by test accuracy: vanilla (0.57) > off-class KM (0.40) > E_ii KM (0.17).
-- `E_ii` is the most rigid target: it pins *every* entry of M(x) to a fixed sparse matrix. On the harder MNIST-1D task this is a very stiff objective and it barely clears chance (0.17 vs 0.10).
-- The recommended `off-class` loss relaxes this -- it only forces the wrong-class rows to vanish and the true logit to 1, leaving the per-feature attribution free. That larger solution set trains far better (0.40), closing much of the gap to cross-entropy (0.57) while still being a genuine loss on the knowledge matrix.
+- Chance level is 0.10. Ranking by test accuracy: vanilla (0.57) > off-class (0.40) > row-norm CE (0.27) > row-norm margin (0.17) > E_ii (0.17).
+- `E_ii` is the most rigid target: it pins *every* entry of M(x) to a fixed sparse matrix; on MNIST-1D it barely clears chance (0.17).
+- The `off-class` loss (wrong rows -> 0, true logit -> 1) frees the per-feature attribution and trains best among the KM losses (0.40).
+- The row-norm losses only shape *which* class row carries the mass: cross-entropy on row norms (0.27) and a hinge margin on row norms (0.17). They are the loosest KM targets -- they never constrain the column sums (the actual output), only the row magnitudes.

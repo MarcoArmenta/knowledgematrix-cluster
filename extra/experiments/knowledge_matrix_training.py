@@ -46,6 +46,7 @@ import copy
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from knowledgematrix.neural_net import NN
 from knowledgematrix.matrix_computer import KnowledgeMatrixComputer
@@ -201,7 +202,50 @@ def loss_km_offclass(M, y):
     return (term_correct + term_wrong).mean()
 
 
-KM_LOSSES = {"km_eii": loss_km_eii, "km_offclass": loss_km_offclass}
+def loss_km_rownorm_ce(M, y):
+    """
+        Cross-entropy on the per-class row *norms* of M(x).
+
+        Let r_k = ||M(x)[k, :]|| be the amount of "explanatory mass" the
+        knowledge matrix places in class row k.  We simply ask the correct
+        class to dominate:  CE(softmax(r), i).  This constrains only which row
+        carries the mass -- neither the exact entries (like E_ii) nor even the
+        column sums (like cross-entropy on the output) -- so it is the loosest
+        KM target here.  Note it is scale-sensitive: bigger weights => larger,
+        more separable norms, which the optimizer can exploit.
+    """
+    row_norm = torch.linalg.norm(M, dim=-1)                # (B, K), >= 0
+    return F.cross_entropy(row_norm, y)
+
+
+def loss_km_rownorm_margin(M, y):
+    """
+        Multiclass margin on the per-class row norms of M(x).
+
+            L = mean_b  relu( margin + max_{j != i} r_j - r_i )
+
+        Pushes the correct class row norm r_i to exceed every other row norm by
+        at least `margin`.  Like the row-norm CE it only shapes *which* row
+        dominates, but with a hinge instead of a soft-max (no reward once the
+        margin is met).
+    """
+    margin = 1.0
+    B, K, _ = M.shape
+    b = torch.arange(B)
+    r = torch.linalg.norm(M, dim=-1)                       # (B, K)
+    r_true = r[b, y]                                       # (B,)
+    r_other = r.clone()
+    r_other[b, y] = float("-inf")                          # mask out the true class
+    r_max_other = r_other.max(dim=-1).values              # (B,)
+    return torch.relu(margin + r_max_other - r_true).mean()
+
+
+KM_LOSSES = {
+    "km_eii": loss_km_eii,
+    "km_offclass": loss_km_offclass,
+    "km_rownorm_ce": loss_km_rownorm_ce,
+    "km_rownorm_margin": loss_km_rownorm_margin,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -318,9 +362,11 @@ def main():
     init_state = copy.deepcopy(SimpleMLP((1, d), k, hidden=args.hidden).state_dict())
 
     runs = [
-        ("km_eii",      "Knowledge matrices  (loss = ||M(x) - E_ii||^2)"),
-        ("km_offclass", "Knowledge matrices  (loss = off-class rows -> 0, true logit -> 1)"),
-        ("vanilla",     "Vanilla             (loss = cross-entropy)"),
+        ("km_eii",           "Knowledge matrices  (loss = ||M(x) - E_ii||^2)"),
+        ("km_offclass",      "Knowledge matrices  (loss = off-class rows -> 0, true logit -> 1)"),
+        ("km_rownorm_ce",    "Knowledge matrices  (loss = cross-entropy on row norms)"),
+        ("km_rownorm_margin","Knowledge matrices  (loss = margin on row norms)"),
+        ("vanilla",          "Vanilla             (loss = cross-entropy)"),
     ]
     results = {}
     for mode, title in runs:
@@ -334,35 +380,43 @@ def main():
 
     # Summary ---------------------------------------------------------------- #
     log("## Final comparison (identical init & hyper-parameters)\n")
-    log("| training                                    | final train acc | final test acc |")
-    log("|---------------------------------------------|-----------------|----------------|")
+    log("| training                                       | final train acc | final test acc |")
+    log("|------------------------------------------------|-----------------|----------------|")
     labels = {
-        "km_eii":      "KM loss  ||M(x) - E_ii||^2",
-        "km_offclass": "KM loss  off-class rows->0, true logit->1",
-        "vanilla":     "vanilla  cross-entropy",
+        "km_eii":            "KM loss  ||M(x) - E_ii||^2",
+        "km_offclass":       "KM loss  off-class rows->0, true logit->1",
+        "km_rownorm_ce":     "KM loss  cross-entropy on row norms",
+        "km_rownorm_margin": "KM loss  margin on row norms",
+        "vanilla":           "vanilla  cross-entropy",
     }
     for mode, _ in runs:
         _, _, tr, te = results[mode]
-        log(f"| {labels[mode]:<43} | {tr:.4f}          | {te:.4f}         |")
+        log(f"| {labels[mode]:<46} | {tr:.4f}          | {te:.4f}         |")
 
     chance = 1.0 / k
     eii_te = results["km_eii"][3]
     off_te = results["km_offclass"][3]
+    rce_te = results["km_rownorm_ce"][3]
+    rmg_te = results["km_rownorm_margin"][3]
     van_te = results["vanilla"][3]
+    ranked = sorted(
+        [("E_ii", eii_te), ("off-class", off_te), ("row-norm CE", rce_te),
+         ("row-norm margin", rmg_te), ("vanilla", van_te)],
+        key=lambda kv: kv[1], reverse=True)
     log("\n## Observations\n")
     log("- The differentiable knowledge matrix matches the library "
         "`KnowledgeMatrixComputer` exactly, so every KM loss is computed on the "
         "true M(W,f)(x).")
     log(f"- Chance level is {chance:.2f}. Ranking by test accuracy: "
-        f"vanilla ({van_te:.2f}) > off-class KM ({off_te:.2f}) > E_ii KM ({eii_te:.2f}).")
+        + " > ".join(f"{name} ({acc:.2f})" for name, acc in ranked) + ".")
     log(f"- `E_ii` is the most rigid target: it pins *every* entry of M(x) to a "
-        "fixed sparse matrix. On the harder MNIST-1D task this is a very stiff "
-        f"objective and it barely clears chance ({eii_te:.2f} vs {chance:.2f}).")
-    log(f"- The recommended `off-class` loss relaxes this -- it only forces the "
-        "wrong-class rows to vanish and the true logit to 1, leaving the "
-        "per-feature attribution free. That larger solution set trains far "
-        f"better ({off_te:.2f}), closing much of the gap to cross-entropy "
-        f"({van_te:.2f}) while still being a genuine loss on the knowledge matrix.")
+        f"fixed sparse matrix; on MNIST-1D it barely clears chance ({eii_te:.2f}).")
+    log(f"- The `off-class` loss (wrong rows -> 0, true logit -> 1) frees the "
+        f"per-feature attribution and trains best among the KM losses ({off_te:.2f}).")
+    log(f"- The row-norm losses only shape *which* class row carries the mass: "
+        f"cross-entropy on row norms ({rce_te:.2f}) and a hinge margin on row "
+        f"norms ({rmg_te:.2f}). They are the loosest KM targets -- they never "
+        "constrain the column sums (the actual output), only the row magnitudes.")
 
     if args.report:
         with open(args.report, "w") as f:

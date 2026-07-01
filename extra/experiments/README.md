@@ -64,23 +64,44 @@ python extra/experiments/knowledge_matrix_training.py --dataset mnist1d --epochs
 Useful flags: `--dataset {mnist1d,blobs}`, `--hidden`, `--epochs`, `--lr`,
 `--batch-size`, `--seed` (and `--d`, `--k`, `--n-train`, `--n-test` for blobs).
 
+## Additional KM losses (loosest targets)
+
+Two further losses shape only *which* class row of `M(x)` carries the explanatory
+mass, via its row norm `r_k = ||M(x)[k, :]||`:
+
+- **`rownorm_ce`** — cross-entropy on the row norms: `CE(softmax(r), i)`.
+- **`rownorm_margin`** — a multiclass hinge: `relu(margin + max_{j≠i} r_j − r_i)`.
+
+These never constrain the column sums (the actual output), only the row magnitudes,
+so they are the loosest KM targets here — and, empirically, the weakest.
+
 ## Findings
 
-**MNIST-1D** (hidden=64, 60 epochs, lr 1e-3, seed 0 — see
-[`results_mnist1d.md`](results_mnist1d.md)):
+All five losses, identical init & hyper-parameters (hidden=64, lr 1e-3, seed 0).
+
+**MNIST-1D** (60 epochs — [`results_mnist1d.md`](results_mnist1d.md)):
 
 | training                                  | train acc | test acc |
 |-------------------------------------------|-----------|----------|
-| KM loss `‖M(x) − E_ii‖²`                  | 0.15      | 0.17     |
-| KM loss  off-class rows→0, true logit→1   | 0.43      | 0.40     |
-| vanilla  cross-entropy                    | 0.81      | 0.57     |
+| KM `‖M(x) − E_ii‖²`                       | 0.15      | 0.17     |
+| KM off-class rows→0, true logit→1         | 0.43      | **0.40** |
+| KM cross-entropy on row norms             | 0.27      | 0.27     |
+| KM margin on row norms                    | 0.17      | 0.17     |
+| vanilla cross-entropy                     | 0.81      | 0.57     |
 
-On this harder task the rigid `E_ii` target barely clears the 0.10 chance level,
-whereas the recommended `off-class` loss learns substantially and closes much of the
-gap to cross-entropy — while remaining a genuine loss on the knowledge matrix. On the
-easy `blobs` task the `off-class` loss matches vanilla exactly (1.00) and `E_ii`
-reaches ~0.87.
+**blobs** (40 epochs — [`results_blobs.md`](results_blobs.md)):
+
+| training                                  | train acc | test acc |
+|-------------------------------------------|-----------|----------|
+| KM `‖M(x) − E_ii‖²`                       | 0.75      | 0.74     |
+| KM off-class rows→0, true logit→1         | 1.00      | **1.00** |
+| KM cross-entropy on row norms             | 0.17      | 0.16     |
+| KM margin on row norms                    | 0.21      | 0.20     |
+| vanilla cross-entropy                     | 1.00      | 1.00     |
 
 Takeaway: you *can* train through the knowledge matrix, and how you shape the target
-matters a lot. Constraining the cross-class structure of `M(x)` while leaving the
-per-feature attribution free is far more trainable than pinning the entire matrix.
+matters enormously. The `off-class` loss — constrain the cross-class structure of
+`M(x)` while leaving the per-feature attribution free — is by far the best KM target
+(it even matches vanilla on `blobs`). The rigid `E_ii` is much harder to optimize,
+and the row-norm losses (which ignore the column sums / output entirely) barely beat
+chance on both tasks.
