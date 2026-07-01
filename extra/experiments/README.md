@@ -273,3 +273,51 @@ every MLP and for CNN depth ≥ 2; KM tops out at **train ≈ 0.83**):
   actually worse for KM: MLP 0.27 (KM) vs 0.25 (CE); CNN **0.075 (KM) vs 0.048 (CE)**.
   So KM only looks like a regularizer in the small/underfit regime; given enough
   capacity it overfits like anything else, without closing the accuracy gap.
+
+### Regularized HPO: weight decay + LR-scheduler search + mid-training best (`hpo_reg.py`)
+
+Random search adding **weight decay** `{0, 1e-5, 1e-4, 1e-3, 1e-2}` and an **LR-scheduler
+search** `{none, cosine, step, exp, onecycle, plateau}` on top of architecture and lr
+(SGD momentum 0.9, 100 epochs). Every config is evaluated on val/test **each epoch** and
+selected by its **best-by-validation checkpoint** (mid-training best / early stopping),
+not the final epoch. Full logs: `results_reg.md`.
+
+Best configuration in every case (test at the best-val checkpoint; final in parens):
+
+| family | loss | best config | best epoch | **best test** (final) |
+|--------|------|-------------|-----------|-----------------------|
+| MLP | off-class KM | d=2, w=512, lr=0.3, wd=0, sched=step | 74 | **0.46** (0.48) |
+| MLP | vanilla CE   | d=1, w=512, lr=0.3, wd=1e-5, sched=plateau | 16 | **0.64** (0.63) |
+| CNN | off-class KM | d=3, ch=(32,64,128), lr=0.01, wd=1e-5, sched=onecycle | 97 | **0.56** (0.56) |
+| CNN | vanilla CE   | d=2, ch=(32,64), lr=0.03, wd=0, sched=plateau | 36 | **0.94** (0.94) |
+
+Mean best-test per scheduler (noisy — each scheduler sees different random archs/lrs):
+
+| family | loss | none | cosine | step | exp | onecycle | plateau |
+|--------|------|------|--------|------|-----|----------|---------|
+| CNN | vanilla CE | .73 | **.94** | .80 | .87 | .93 | .75 |
+| CNN | off-class KM | .29 | .36 | .41 | .17 | **.56** | .43 |
+| MLP | vanilla CE | **.61** | .55 | .57 | .41 | .56 | .58 |
+| MLP | off-class KM | **.46** | .25 | .32 | .22 | .37 | .26 |
+
+Findings from adding regularization + scheduler search + mid-training best:
+
+- **Mid-training best matters most for the KM loss.** KM training is unstable and often
+  *peaks then degrades*, so the best checkpoint beats the final epoch by up to +0.14
+  (e.g. a CNN-KM run 0.32 best vs 0.19 final; an MLP-KM run 0.46 vs 0.41). Early stopping
+  / best-checkpoint selection is effectively part of making the KM loss usable. Vanilla is
+  steadier but early stopping still rescues the occasional late collapse (one CNN-CE run:
+  0.26 best vs 0.10 final).
+- **Weight decay does not help — it hurts KM.** Every winning config uses `wd ∈ {0, 1e-5}`;
+  larger `wd` (1e-3, 1e-2) consistently lowers accuracy and, combined with high lr, collapses
+  KM to chance (0.10). Adding L2 regularization to a loss that already *underfits* is
+  counter-productive.
+- **KM is far more lr/scheduler-sensitive than vanilla.** `lr=0.3` repeatedly collapses KM
+  to chance while vanilla tolerates it; aggressive `exp` decay is the worst scheduler overall;
+  `onecycle`/`cosine` are best for the CNN. Vanilla is robust across schedulers.
+- **Caveat — random search underperformed the controlled grid for CNN-KM** (0.56 here vs 0.76
+  in the depth×width grid): with a 6-way scheduler × 5-way wd × lr × architecture space and
+  only 12 CNN trials, it under-sampled the good "big-CNN + cosine + lr=0.1" region the grid
+  hit directly. For a stiff, sensitive objective like KM, a controlled sweep beats sparse
+  random search. None of this changes the headline: **vanilla still wins every case**, and
+  tuning/regularization mostly help KM catch up rather than overtake.

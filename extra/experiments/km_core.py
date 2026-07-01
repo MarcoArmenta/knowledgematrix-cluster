@@ -290,14 +290,42 @@ def accuracy(model, x, y, batch=1024):
     return correct / x.shape[0]
 
 
+SCHEDULERS = ("none", "cosine", "step", "exp", "onecycle", "plateau")
+
+
+def _make_scheduler(opt, name, epochs, lr):
+    """Returns (scheduler_or_None, needs_val_metric)."""
+    L = torch.optim.lr_scheduler
+    if name in (None, "none", "constant"):
+        return None, False
+    if name == "cosine":
+        return L.CosineAnnealingLR(opt, T_max=epochs), False
+    if name == "step":
+        return L.StepLR(opt, step_size=max(1, epochs // 3), gamma=0.1), False
+    if name == "exp":
+        return L.ExponentialLR(opt, gamma=0.01 ** (1.0 / max(1, epochs))), False
+    if name == "onecycle":
+        return L.OneCycleLR(opt, max_lr=lr, total_steps=epochs), False
+    if name == "plateau":
+        return L.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=5), True
+    raise ValueError(f"unknown scheduler {name!r}")
+
+
 def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
           weight_decay=0.0, km_batch=None, seed=0,
-          optimizer="adam", momentum=0.9, scheduler=None):
+          optimizer="adam", momentum=0.9, scheduler=None,
+          eval_data=None, eval_every=1, return_metrics=False):
     """
         mode = 'vanilla' (cross-entropy) or a key of KM_LOSSES.
         km_batch: optional smaller batch size for the (heavier) KM forward.
         optimizer: 'adam' or 'sgd' (SGD uses `momentum`, Nesterov when > 0).
-        scheduler: None or 'cosine' (CosineAnnealingLR stepped per epoch).
+        scheduler: one of SCHEDULERS (none/cosine/step/exp/onecycle/plateau).
+        weight_decay: L2 regularization strength (searched in the reg. HPO).
+        eval_data: optional (x_val, y_val, x_test, y_test); when given, val/test
+            accuracy is measured every `eval_every` epochs and the best-by-val
+            checkpoint ("mid-training best") is tracked.
+        return_metrics: if True, return a dict with `final` and `best` metrics
+            and the per-eval `history`; otherwise return the model.
     """
     if optimizer == "sgd":
         opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum,
@@ -307,18 +335,17 @@ def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
     else:
         raise ValueError(f"unknown optimizer {optimizer!r}")
 
-    sched = None
-    if scheduler == "cosine":
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    elif scheduler not in (None, "none"):
-        raise ValueError(f"unknown scheduler {scheduler!r}")
+    sched, needs_metric = _make_scheduler(opt, scheduler, epochs, lr)
 
     ce = nn.CrossEntropyLoss()
     km_loss = KM_LOSSES.get(mode)
     bs = km_batch if (km_loss is not None and km_batch) else batch_size
     n = x_tr.shape[0]
     g = torch.Generator().manual_seed(seed)
-    for _ in range(epochs):
+
+    history = []
+    best = {"epoch": 0, "val": -1.0, "test": 0.0}
+    for epoch in range(1, epochs + 1):
         model.train()
         perm = torch.randperm(n, generator=g)
         for s in range(0, n, bs):
@@ -332,6 +359,28 @@ def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
                 loss = ce(model.forward(xb), yb)
             loss.backward()
             opt.step()
+
+        val_acc = None
+        if eval_data is not None and (epoch % eval_every == 0 or epoch == epochs):
+            xval, yval, xte, yte = eval_data
+            val_acc = accuracy(model, xval, yval)
+            test_acc = accuracy(model, xte, yte)
+            history.append((epoch, val_acc, test_acc))
+            if val_acc > best["val"]:
+                best = {"epoch": epoch, "val": val_acc, "test": test_acc}
+
         if sched is not None:
-            sched.step()
-    return model
+            if needs_metric:
+                sched.step(val_acc if val_acc is not None else 0.0)
+            else:
+                sched.step()
+
+    if not return_metrics:
+        return model
+
+    final = {"train": accuracy(model, x_tr, y_tr)}
+    if eval_data is not None:
+        xval, yval, xte, yte = eval_data
+        final["val"] = accuracy(model, xval, yval)
+        final["test"] = accuracy(model, xte, yte)
+    return {"model": model, "final": final, "best": best, "history": history}
