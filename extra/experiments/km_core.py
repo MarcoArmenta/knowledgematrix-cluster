@@ -291,12 +291,28 @@ def accuracy(model, x, y, batch=1024):
 
 
 def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
-          weight_decay=0.0, km_batch=None, seed=0):
+          weight_decay=0.0, km_batch=None, seed=0,
+          optimizer="adam", momentum=0.9, scheduler=None):
     """
         mode = 'vanilla' (cross-entropy) or a key of KM_LOSSES.
         km_batch: optional smaller batch size for the (heavier) KM forward.
+        optimizer: 'adam' or 'sgd' (SGD uses `momentum`, Nesterov when > 0).
+        scheduler: None or 'cosine' (CosineAnnealingLR stepped per epoch).
     """
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if optimizer == "sgd":
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum,
+                              nesterov=momentum > 0, weight_decay=weight_decay)
+    elif optimizer == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"unknown optimizer {optimizer!r}")
+
+    sched = None
+    if scheduler == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    elif scheduler not in (None, "none"):
+        raise ValueError(f"unknown scheduler {scheduler!r}")
+
     ce = nn.CrossEntropyLoss()
     km_loss = KM_LOSSES.get(mode)
     bs = km_batch if (km_loss is not None and km_batch) else batch_size
@@ -316,4 +332,6 @@ def train(model, x_tr, y_tr, *, mode, epochs, lr, batch_size,
                 loss = ce(model.forward(xb), yb)
             loss.backward()
             opt.step()
+        if sched is not None:
+            sched.step()
     return model

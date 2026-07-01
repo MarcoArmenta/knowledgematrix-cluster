@@ -152,3 +152,36 @@ Conclusions after tuning:
 
 All knowledge matrices in these experiments are computed with the differentiable
 gradient (`jacrev`) backend described above, checked exact against the library.
+
+### Stronger optimization: SGD+momentum, cosine LR, 100 epochs
+
+Re-running the sweep with **SGD (momentum 0.9, Nesterov) + cosine-annealing LR over
+100 epochs** (both losses identical; `results_hpo_sgd100.md`):
+
+```
+python extra/experiments/hpo.py --mlp-trials 10 --cnn-trials 8 --epochs 100 \
+       --optimizer sgd --momentum 0.9 --scheduler cosine \
+       --report extra/experiments/results_hpo_sgd100.md
+```
+
+| family | loss | best config | train | val | **test** | same-config other loss |
+|--------|------|-------------|-------|-----|----------|-------------------------|
+| MLP | off-class KM | hidden=256, depth=2, lr=0.1, bs=128 | 0.75 | 0.53 | **0.48** | vanilla 0.66 |
+| MLP | vanilla CE   | hidden=256, depth=3, lr=0.1, bs=64  | 1.00 | 0.73 | **0.73** | KM 0.45 |
+| CNN | off-class KM | ch=(16,32,64), k=5, hid=64, lr=0.1  | 0.71 | 0.66 | **0.64** | vanilla 0.95 |
+| CNN | vanilla CE   | ch=(16,32,64), k=3, hid=32, lr=0.1  | 1.00 | 0.95 | **0.96** | KM 0.56 |
+
+What the stronger regime changes (vs the Adam / shorter run above):
+
+- **The KM loss benefits a lot from more optimization.** Off-class KM on the CNN
+  jumps **0.40 → 0.64**, and it now *does* exploit convolutional capacity
+  (0.48 MLP → 0.64 CNN, whereas before it was flat ~0.40–0.46). Its train accuracy
+  rises to ~0.71–0.75 (from ~0.44–0.64): momentum + a long cosine decay push this
+  stiff target much further, so the earlier plateau was largely an optimization
+  limit, not a hard ceiling.
+- **Vanilla still wins at every capacity, but the CNN gap narrows** from ~0.53 to
+  ~0.32 (0.96 vs 0.64). Cross-entropy also improved (0.93 → 0.96) and still fits the
+  training set completely (train 1.00).
+- Net: better optimization is worth more to the KM loss than to cross-entropy, but
+  even tuned hard it remains a harder objective that trails CE — consistent with
+  using it as an auxiliary/regularizing term rather than the sole loss.

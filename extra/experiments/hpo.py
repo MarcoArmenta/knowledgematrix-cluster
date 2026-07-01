@@ -29,29 +29,34 @@ LOSSES = ["km_offclass", "vanilla"]
 # --------------------------------------------------------------------------- #
 #  Search spaces
 # --------------------------------------------------------------------------- #
-def sample_mlp(rng):
+# SGD-with-momentum learning rates (higher than the earlier Adam sweep).
+MLP_LR = [1e-2, 3e-2, 1e-1, 3e-1]
+CNN_LR = [1e-2, 3e-2, 1e-1]
+
+
+def sample_mlp(rng, epochs):
     return dict(
         family="mlp",
         hidden=rng.choice([32, 64, 128, 256]),
         depth=rng.choice([1, 2, 3]),
-        lr=rng.choice([3e-4, 1e-3, 3e-3]),
+        lr=rng.choice(MLP_LR),
         batch_size=rng.choice([64, 128, 256]),
         weight_decay=rng.choice([0.0, 1e-4, 1e-3]),
-        epochs=60,
+        epochs=epochs,
     )
 
 
-def sample_cnn(rng):
+def sample_cnn(rng, epochs):
     return dict(
         family="cnn",
         channels=rng.choice([(16,), (32,), (16, 32), (32, 64), (16, 32, 64)]),
         kernel=rng.choice([3, 5]),
         hidden=rng.choice([32, 64, 128]),
         pool_out=rng.choice([2, 3, 4]),
-        lr=rng.choice([3e-4, 1e-3, 3e-3]),
+        lr=rng.choice(CNN_LR),
         batch_size=rng.choice([64, 128]),
         weight_decay=rng.choice([0.0, 1e-4]),
-        epochs=35,
+        epochs=epochs,
     )
 
 
@@ -73,7 +78,7 @@ def cfg_str(cfg):
 # --------------------------------------------------------------------------- #
 #  One trial: train both losses on identical architecture + init
 # --------------------------------------------------------------------------- #
-def run_trial(cfg, trial_seed, data):
+def run_trial(cfg, trial_seed, data, opt_cfg):
     xtr, ytr, xval, yval, xte, yte = data
     torch.manual_seed(trial_seed)
     init_state = copy.deepcopy(build(cfg).state_dict())
@@ -87,7 +92,7 @@ def run_trial(cfg, trial_seed, data):
             km_batch = 32 if cfg["family"] == "cnn" else cfg["batch_size"]
         C.train(model, xtr, ytr, mode=loss, epochs=cfg["epochs"], lr=cfg["lr"],
                 batch_size=cfg["batch_size"], weight_decay=cfg["weight_decay"],
-                km_batch=km_batch, seed=0)
+                km_batch=km_batch, seed=0, **opt_cfg)
         out[loss] = dict(train=C.accuracy(model, xtr, ytr),
                          val=C.accuracy(model, xval, yval),
                          test=C.accuracy(model, xte, yte))
@@ -101,9 +106,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mlp-trials", type=int, default=12)
     p.add_argument("--cnn-trials", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--optimizer", choices=["sgd", "adam"], default="sgd")
+    p.add_argument("--momentum", type=float, default=0.9)
+    p.add_argument("--scheduler", choices=["cosine", "none"], default="cosine")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--report", type=str, default="extra/experiments/results_hpo.md")
     args = p.parse_args()
+    opt_cfg = dict(optimizer=args.optimizer, momentum=args.momentum, scheduler=args.scheduler)
 
     torch.set_default_dtype(torch.float32)
     lines = []
@@ -129,6 +139,10 @@ def main():
         f"classes={NUM_CLASSES}.")
     log(f"KM (gradient/jacrev) faithfulness vs library (float64): "
         f"MLP rel={dm[1]:.1e}, CNN rel={dc[1]:.1e} (0 == exact).")
+    sched_txt = "cosine-annealing LR" if args.scheduler == "cosine" else "no LR schedule"
+    opt_txt = (f"SGD (momentum={args.momentum}, Nesterov)" if args.optimizer == "sgd"
+               else "Adam")
+    log(f"Optimizer: {opt_txt}, {sched_txt}, {args.epochs} epochs.")
     log("Every configuration trains both losses on the SAME architecture and the "
         "SAME initial weights. Model selection is by validation accuracy; the "
         "reported number is test accuracy.\n")
@@ -143,9 +157,9 @@ def main():
         log("|---|--------|--------|---------|-------------|--------------|")
         trials = []
         for t in range(n_trials):
-            cfg = sampler(rng)
+            cfg = sampler(rng, args.epochs)
             t0 = time.time()
-            res = run_trial(cfg, args.seed + 100 * t, data)
+            res = run_trial(cfg, args.seed + 100 * t, data, opt_cfg)
             dt = time.time() - t0
             trials.append((cfg, res))
             log(f"| {t+1} | {cfg_str(cfg)} | {res['km_offclass']['val']:.3f} | "
