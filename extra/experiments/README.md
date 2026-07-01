@@ -35,14 +35,20 @@ confident, correct output — but the network is free to choose *how* the true l
 is attributed across the input features. This is a strictly larger solution set than
 `E_ii`, and it trains much better.
 
-## Differentiable knowledge matrix
+## Differentiable knowledge matrix (gradient backend)
 
 The library's `KnowledgeMatrixComputer` runs under `torch.no_grad()` and cannot be
-used as a training loss. For a `Flatten/Linear/ReLU` MLP the knowledge matrix has a
-closed form that *is* differentiable w.r.t. the weights (with the ReLU gating pattern
-held fixed — the correct sub-gradient almost everywhere). It is implemented in
-`knowledge_matrix_mlp()` and checked numerically against the library computer at the
-start of every run (`abs_diff = 0` to machine precision).
+used as a training loss. The shared core (`km_core.py`) computes `M(x)` with the
+**gradient × input** method from the repo's `gradient-km` branch
+(`knowledgematrix/gradient_matrix.py`, `GradientMatrixComputer`): for a
+piecewise-linear network `f(x) = J(x) x + c(x)`, the input columns of `M(x)` are the
+per-class input Jacobian scaled by the input, `J(x) ⊙ x`, and the bias column is
+`c(x) = f(x) − J(x) x`. The Jacobian is obtained with `torch.func.jacrev`
+(reverse-mode autograd), which stays differentiable w.r.t. the weights, so it can
+drive a loss. `km_core.grad_knowledge_matrix()` batches this over a minibatch with
+`vmap` (and also works for CNNs, unlike the single-sample class). It is checked
+against `KnowledgeMatrixComputer` at the start of every run (`rel_diff ≈ 1e-16`, i.e.
+exact; a hand-rolled forward-propagation KM is kept as a second cross-check).
 
 ## Data
 
@@ -105,3 +111,44 @@ matters enormously. The `off-class` loss — constrain the cross-class structure
 (it even matches vanilla on `blobs`). The rigid `E_ii` is much harder to optimize,
 and the row-norm losses (which ignore the column sums / output entirely) barely beat
 chance on both tasks.
+
+## Pushing harder: HPO + CNNs (`hpo.py`)
+
+`hpo.py` runs a random hyper-parameter search comparing the **off-class KM loss**
+against **vanilla cross-entropy** for both an **MLP** and a **1D-CNN** on MNIST-1D.
+Every sampled configuration trains both losses on the *same architecture and the same
+initial weights*; model selection is by a held-out validation split (500 of the 4000
+train points), and the reported number is test accuracy.
+
+```
+python extra/experiments/hpo.py --mlp-trials 12 --cnn-trials 10 \
+       --report extra/experiments/results_hpo.md
+```
+
+Best configuration found for each family/loss (full search in
+[`results_hpo.md`](results_hpo.md)):
+
+| family | loss | best config | train | val | **test** | same-config other loss |
+|--------|------|-------------|-------|-----|----------|-------------------------|
+| MLP | off-class KM | hidden=256, depth=2, lr=3e-3, bs=256 | 0.64 | 0.48 | **0.46** | vanilla 0.63 |
+| MLP | vanilla CE   | hidden=128, depth=2, lr=3e-3, bs=64  | 1.00 | 0.66 | **0.63** | KM 0.39 |
+| CNN | off-class KM | ch=(16,32,64), k=5, hid=64, lr=3e-3  | 0.44 | 0.45 | **0.40** | vanilla 0.91 |
+| CNN | vanilla CE   | ch=(32,64), k=5, hid=128, lr=3e-3    | 0.99 | 0.93 | **0.93** | KM 0.37 |
+
+Conclusions after tuning:
+
+- **Vanilla wins at every capacity, and the gap widens with the CNN.** Best MLP:
+  0.63 vs 0.46; best CNN: **0.93 vs 0.40**. Cross-entropy turns convolutional
+  capacity into a +30-point jump (0.63 → 0.93); the off-class KM loss does *not*
+  benefit from the CNN at all (~0.40–0.46 regardless of architecture).
+- **The KM loss underfits by construction.** Even its best configs reach only
+  0.44–0.64 *train* accuracy, versus ~1.00 for vanilla. Its small train↔test gap is
+  a symptom of a hard, heavily-constraining optimization target — not of superior
+  generalization (its test accuracy is always lower).
+- So: training through `M(x)` is real and works, but as a *replacement* for
+  cross-entropy it leaves a lot of accuracy on the table, and the shortfall grows
+  exactly when the architecture (a CNN) has more structure to exploit. Its natural
+  use is as an auxiliary/regularizing term rather than the sole objective.
+
+All knowledge matrices in these experiments are computed with the differentiable
+gradient (`jacrev`) backend described above, checked exact against the library.
