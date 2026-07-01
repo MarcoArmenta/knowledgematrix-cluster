@@ -238,3 +238,38 @@ network is best (or tied-best) everywhere**, and CNNs beat MLPs for both losses.
   training set (train ≈ 1.00) while KM does not (train ≤ 0.83) — so the KM loss keeps
   behaving like a hard, capacity-hungry, regularizing objective rather than a drop-in
   replacement for cross-entropy.
+
+#### Generalization gap (train − test)
+
+Gap = train accuracy − test accuracy, across the same grids (`results_arch.md` has
+the full train and gap grids):
+
+| MLP KM gap | 32 | 64 | 128 | 256 | | MLP CE gap | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **d1** | .03 | .05 | .10 | .12 | | **d1** | .16 | .34 | .42 | .42 |
+| **d2** | .05 | .10 | .13 | .26 | | **d2** | .37 | .39 | .37 | .36 |
+| **d3** | .04 | .08 | .14 | .27 | | **d3** | .43 | .37 | .30 | .31 |
+| **d4** | .04 | .08 | .12 | .21 | | **d4** | .42 | .36 | .29 | .25 |
+
+| CNN KM gap | 8 | 16 | 32 | | CNN CE gap | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|---|---|
+| **d1** | .03 | .04 | .04 | | **d1** | .02 | .04 | .06 |
+| **d2** | .03 | .05 | .04 | | **d2** | .07 | .06 | .05 |
+| **d3** | .06 | .07 | .08 | | **d3** | .07 | .05 | .03 |
+
+Reading these together with the train grids (vanilla reaches **train ≈ 1.00** for
+every MLP and for CNN depth ≥ 2; KM tops out at **train ≈ 0.83**):
+
+- **KM's gap is small mainly because it *underfits*, not because it transfers better.**
+  KM's train and test rise together (train never saturates), so they stay close —
+  while its test accuracy is lower than vanilla's everywhere. A small gap here is the
+  signature of a hard-to-fit objective, not of superior generalization.
+- **Vanilla memorizes (train = 1) and its gap is essentially `1 − test`**, so its gap
+  *shrinks as capacity grows* (bigger net → higher test → smaller gap); e.g. CNN CE
+  gap falls .07 → .03 across depth-3 widths.
+- **The "KM regularizes" story does NOT hold at scale.** As width grows the KM loss
+  starts to overfit too — MLP-KM gap climbs to **0.27** at width 256 (train 0.76 vs
+  test 0.49). At the *winning* (largest) architectures the gaps are comparable or
+  actually worse for KM: MLP 0.27 (KM) vs 0.25 (CE); CNN **0.075 (KM) vs 0.048 (CE)**.
+  So KM only looks like a regularizer in the small/underfit regime; given enough
+  capacity it overfits like anything else, without closing the accuracy gap.

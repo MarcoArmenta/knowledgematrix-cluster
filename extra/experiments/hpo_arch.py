@@ -68,6 +68,18 @@ def grid_table(results, depths, widths, loss, key="test"):
     return "\n".join(lines)
 
 
+def gap_table(results, depths, widths, loss):
+    lines = [f"| depth \\ width | " + " | ".join(str(w) for w in widths) + " |",
+             "|" + "---|" * (len(widths) + 1)]
+    for dpt in depths:
+        cells = []
+        for w in widths:
+            r = results[(dpt, w)][loss]
+            cells.append(f"{r['train'] - r['test']:.3f}")
+        lines.append(f"| **{dpt}** | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=100)
@@ -132,14 +144,20 @@ def main():
             log(f"### {fam} — {name}: test accuracy\n")
             log(grid_table(results, depths, widths, loss, "test"))
             log("")
+            log(f"### {fam} — {name}: train accuracy\n")
+            log(grid_table(results, depths, widths, loss, "train"))
+            log("")
+            log(f"### {fam} — {name}: generalization gap (train − test)\n")
+            log(gap_table(results, depths, widths, loss))
+            log("")
             # winner by validation accuracy
             (bd, bw) = max(results, key=lambda k: results[k][loss]["val"])
             r = results[(bd, bw)][loss]
             winners[(fam, loss)] = (bd, bw, r["train"], r["val"], r["test"])
 
     log("## Winning architecture in every case (selected by validation accuracy)\n")
-    log("| family | loss | winning architecture | train | val | test |")
-    log("|--------|------|----------------------|-------|-----|------|")
+    log("| family | loss | winning architecture | train | val | test | gap (train−test) |")
+    log("|--------|------|----------------------|-------|-----|------|------------------|")
     for fam, _, _, _, _, wn in families:
         for loss in LOSSES:
             name = "off-class KM" if loss == "km_offclass" else "vanilla CE"
@@ -149,7 +167,7 @@ def main():
             else:
                 ch = tuple(bw * (2 ** i) for i in range(bd))
                 arch = f"depth={bd}, channels={ch}"
-            log(f"| {fam} | {name} | {arch} | {tr:.3f} | {vl:.3f} | **{te:.3f}** |")
+            log(f"| {fam} | {name} | {arch} | {tr:.3f} | {vl:.3f} | **{te:.3f}** | {tr - te:.3f} |")
 
     with open(args.report, "w") as f:
         f.write("\n".join(lines) + "\n")
