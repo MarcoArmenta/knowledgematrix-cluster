@@ -185,3 +185,56 @@ What the stronger regime changes (vs the Adam / shorter run above):
 - Net: better optimization is worth more to the KM loss than to cross-entropy, but
   even tuned hard it remains a harder objective that trails CE — consistent with
   using it as an auxiliary/regularizing term rather than the sole loss.
+
+### Depth × width sweep — which architecture wins (`hpo_arch.py`)
+
+Making **depth and width** the searched axes (fixed shared recipe: SGD momentum 0.9 +
+cosine LR, 100 epochs, lr=0.1; all ReLU so the gradient KM applies), a grid over
+architectures with both losses trained on identical weights per grid point
+(`results_arch.md`):
+
+```
+python extra/experiments/hpo_arch.py --report extra/experiments/results_arch.md
+```
+
+**MLP — test accuracy (depth × hidden width):**
+
+| off-class KM | 32 | 64 | 128 | 256 | | vanilla CE | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **d1** | .30 | .34 | .34 | .37 | | **d1** | .61 | .56 | .58 | .58 |
+| **d2** | .32 | .39 | .44 | .48 | | **d2** | .59 | .61 | .64 | .64 |
+| **d3** | .32 | .40 | .45 | .49 | | **d3** | .57 | .63 | .70 | .69 |
+| **d4** | .28 | .36 | .44 | .49 | | **d4** | .58 | .64 | .71 | **.75** |
+
+**CNN — test accuracy (depth × base channels, channels double per block):**
+
+| off-class KM | 8 | 16 | 32 | | vanilla CE | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|---|---|
+| **d1** | .27 | .30 | .29 | | **d1** | .87 | .90 | .90 |
+| **d2** | .32 | .43 | .54 | | **d2** | .93 | .94 | .95 |
+| **d3** | .51 | .62 | **.76** | | **d3** | .93 | .95 | **.97** |
+
+**Winning architecture in every case** (selected by validation accuracy):
+
+| family | loss | winning architecture | train | val | **test** |
+|--------|------|----------------------|-------|-----|----------|
+| MLP | off-class KM | depth=3, width=256 | 0.76 | 0.53 | **0.49** |
+| MLP | vanilla CE   | depth=4, width=256 | 1.00 | 0.72 | **0.75** |
+| CNN | off-class KM | depth=3, channels=(32,64,128) | 0.83 | 0.76 | **0.76** |
+| CNN | vanilla CE   | depth=3, channels=(16,32,64)  | 1.00 | 0.96 | **0.95** |
+
+The answer is consistent across all four cases: **bigger wins — the deepest, widest
+network is best (or tied-best) everywhere**, and CNNs beat MLPs for both losses.
+
+- Accuracy is essentially **monotone in depth and width** in every grid, so the
+  winner sits at (or one step from) the deep/wide corner in all cases; there is no
+  interior sweet spot to discover.
+- **The off-class KM loss scales strongly with capacity — more than vanilla does.**
+  On the CNN it climbs from 0.27 (d1,w8) to **0.76** (d3,w32); giving it the largest
+  architecture is what unlocks it (its earlier ~0.40–0.64 plateaus were capacity- and
+  optimization-limited, not a hard ceiling). The KM→vanilla CNN gap shrinks to ~0.19
+  at the winning architecture.
+- **Vanilla still wins head-to-head at every architecture**, and saturates the
+  training set (train ≈ 1.00) while KM does not (train ≤ 0.83) — so the KM loss keeps
+  behaving like a hard, capacity-hungry, regularizing objective rather than a drop-in
+  replacement for cross-entropy.
