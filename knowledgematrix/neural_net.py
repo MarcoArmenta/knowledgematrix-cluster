@@ -148,6 +148,9 @@ class NN(nn.Module):
     def tanh(self) -> None:
         self.layers.append(nn.Tanh())
 
+    def gelu(self, approximate: str = "none") -> None:
+        self.layers.append(nn.GELU(approximate=approximate))
+
     ### Residual Connections ###
 
     def residual(self, start: int, end: int) -> None:
@@ -225,7 +228,7 @@ class NN(nn.Module):
                 elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
                     x, indices = layer(x)
                     self.maxpool_indices[i] = indices
-                elif isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh)):
+                elif isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU)):
                     self.pre_acts[i] = x.detach().clone()
                     x = layer(x)
                     self.acts[i] = x.detach().clone()

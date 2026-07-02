@@ -92,7 +92,7 @@ class KnowledgeMatrixComputer:
                         inputs_residuals[i] = B.detach().clone()
                     if i in self.model.residuals:
                         B = self.model.apply_residual(B, inputs_residuals, layer=i, affine=False)
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh)):
+                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU)):
                         # Get activation ratios
                         pre_act = self.model.pre_acts[i].to(self.device)
                         post_act = self.model.acts[i].to(self.device)
@@ -148,7 +148,7 @@ class KnowledgeMatrixComputer:
                         inputs_residuals[i] = a.detach().clone()
                     if i in self.model.residuals:
                         a = self.model.apply_residual(a, inputs_residuals, layer=i)
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh)):
+                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU)):
                         pre_act = self.model.pre_acts[i].to(self.device)
                         post_act = self.model.acts[i].to(self.device)
                         vertices = post_act / pre_act
