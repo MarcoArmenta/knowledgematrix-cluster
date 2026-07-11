@@ -576,10 +576,12 @@ class MultiHeadAttention(nn.Module):
         which is inspired by the Attention is All You Need paper.
     """
     def __init__(
-            self, 
-            d_model: int, 
+            self,
+            d_model: int,
             num_heads: int,
-            mask: Union[torch.Tensor,None]=None
+            mask: Union[torch.Tensor,None]=None,
+            rotary_pct: float = 0.0,
+            rope_base: int = 10000
         ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
@@ -589,6 +591,9 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
         self.mask = mask
+        self.rotary_pct = rotary_pct
+        self.rope_base = rope_base
+        self.rotary_ndims = int(self.d_head * rotary_pct) if rotary_pct > 0 else 0
 
         self.save_pattern = False
         self.attn_pattern = None
@@ -597,6 +602,26 @@ class MultiHeadAttention(nn.Module):
         self.K = nn.Linear(d_model, d_model)
         self.V = nn.Linear(d_model, d_model)
         self.O = nn.Linear(d_model, d_model)
+
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor):
+        """GPT-NeoX-style partial rotary on the first rotary_ndims of q/k.
+        Shapes: (batch, B, H, T, d_head)."""
+        nd = self.rotary_ndims
+        T = q.shape[-2]
+        inv = 1.0 / (self.rope_base ** (torch.arange(0, nd, 2, device=q.device, dtype=q.dtype) / nd))
+        t = torch.arange(T, device=q.device, dtype=q.dtype)
+        emb = torch.cat([torch.outer(t, inv)] * 2, dim=-1)      # (T, nd)
+        cos, sin = emb.cos(), emb.sin()
+
+        def rot_half(x):
+            x1, x2 = x[..., : nd // 2], x[..., nd // 2: nd]
+            return torch.cat((-x2, x1), dim=-1)
+
+        outs = []
+        for src in (q, k):
+            rot, keep = src[..., :nd], src[..., nd:]
+            outs.append(torch.cat((rot * cos + rot_half(rot) * sin, keep), dim=-1))
+        return outs[0], outs[1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, B, T, D = x.shape
@@ -609,10 +634,13 @@ class MultiHeadAttention(nn.Module):
         K = K.view(batch, B, T, self.num_heads, self.d_head).transpose(2, 3)
         V = V.view(batch, B, T, self.num_heads, self.d_head).transpose(2, 3)
 
+        if self.rotary_ndims:
+            Q, K = self._apply_rope(Q, K)
+
         scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
 
         if self.mask is not None:
-            mask = self.mask[:T, :T]
+            mask = self.mask[:T, :T].to(scores.device)
             scores = scores.masked_fill(mask == 0, float("-inf"))
 
         attn = torch.softmax(scores, dim=-1)
