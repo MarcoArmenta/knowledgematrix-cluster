@@ -32,6 +32,63 @@ class KnowledgeMatrixComputer:
         # Saves the output of the NN on the current sample in the forward method
         self.current_output: Union[NN, None] = None
 
+    def _linear_step(self, B: torch.Tensor, i: int, layer) -> torch.Tensor:
+        """Probe-pass (weights-only) transform of layer i. Unknown layers
+        (Dropout in eval, etc.) pass through unchanged."""
+        if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
+            pre_act = self.model.pre_acts[i]
+            post_act = self.model.acts[i]
+            vertices = post_act / pre_act
+            vertices = torch.where(
+                torch.isnan(vertices) | torch.isinf(vertices),
+                self._zero,
+                vertices
+            ).squeeze(0)
+            B = B * vertices
+        elif isinstance(layer, nn.Conv2d):
+            B = F.conv2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding)
+        elif isinstance(layer, (nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Flatten)):
+            B = layer(B)
+        elif isinstance(layer, nn.Linear):
+            B = (layer.weight @ B.transpose(-1, -2)).transpose(-1, -2)
+        elif isinstance(layer, nn.BatchNorm2d):
+            B = B * (layer.weight / torch.sqrt(layer.running_var + layer.eps)).view(1, -1, 1, 1)
+        elif isinstance(layer, nn.LayerNorm):
+            B = B * layer.weight / torch.sqrt(self.model.layernorms[i][1] + layer.eps)
+        elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
+            pool = self.model.maxpool_indices[i]
+            batch_indices = torch.arange(B.shape[0], device=self.device).view(-1, 1, 1, 1)
+            channel_indices = torch.arange(pool.shape[1], device=self.device).view(1, -1, 1, 1)
+            row_indices = pool // B.shape[2] if self.IN_2D else pool
+            col_indices = pool % B.shape[3]
+            B = B[batch_indices, channel_indices, row_indices, col_indices]
+        return B
+
+    def _affine_step(self, a: torch.Tensor, i: int, layer) -> torch.Tensor:
+        """Bias-pass (full affine) transform of layer i."""
+        if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
+            pre_act = self.model.pre_acts[i]
+            post_act = self.model.acts[i]
+            vertices = post_act / pre_act
+            vertices = torch.where(
+                torch.isnan(vertices) | torch.isinf(vertices),
+                self._zero,
+                vertices
+            )
+            a = a * vertices
+        elif isinstance(layer, (nn.Conv2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.Flatten, nn.Linear)):
+            a = layer(a)
+        elif isinstance(layer, nn.LayerNorm):
+            a = ((a - self.model.layernorms[i][0]) / torch.sqrt(self.model.layernorms[i][1] + layer.eps)) * layer.weight + layer.bias
+        elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
+            pool = self.model.maxpool_indices[i]
+            batch_indices = torch.arange(pool.shape[0], device=self.device).view(-1, 1, 1, 1)
+            channel_indices = torch.arange(pool.shape[1], device=self.device).view(1, -1, 1, 1)
+            row_indices = pool // a.shape[2] if self.IN_2D else pool
+            col_indices = pool % a.shape[3]
+            a = a[batch_indices, channel_indices, row_indices, col_indices]
+        return a
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
             Computes the knowledge matrix of a NN at a given input point.
@@ -60,10 +117,10 @@ class KnowledgeMatrixComputer:
             output_size = self.current_output.numel()
             dtype = self.current_output.dtype
 
-            IN_2D = (W > 1)  # Wether the input is of shape (C,H,W) or (C,L,1)
+            self.IN_2D = (W > 1)  # Wether the input is of shape (C,H,W) or (C,L,1)
 
             x = x.to(self.device)
-            _zero = torch.tensor(0.0, device=self.device, dtype=dtype)
+            self._zero = torch.tensor(0.0, device=self.device, dtype=dtype)
             inputs_residuals = [None] * self.model.get_num_layers()
             A = torch.empty((output_size, total_positions), device=self.device, dtype=dtype)
 
@@ -86,40 +143,11 @@ class KnowledgeMatrixComputer:
 
                 B = batched_input
                 for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
-                    # Process each layer type (Conv2d, AvgPool2d, Linear, BatchNorm2d, MaxPool2d, etc.)
-                    # applying the appropriate transformations and handling activation ratios
                     if i in self.model.residuals:
                         B = self.model.apply_residual(B, inputs_residuals, layer=i, affine=False)
                     if i in self.model.residuals_starts:
                         inputs_residuals[i] = B
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
-                        # Get activation ratios
-                        pre_act = self.model.pre_acts[i]
-                        post_act = self.model.acts[i]
-                        vertices = post_act / pre_act
-                        vertices = torch.where(
-                            torch.isnan(vertices) | torch.isinf(vertices),
-                            _zero,
-                            vertices
-                        ).squeeze(0)  # Remove original batch dim
-                        B = B * vertices
-                    elif isinstance(layer, nn.Conv2d):
-                        B = F.conv2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding)
-                    elif isinstance(layer, (nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Flatten)):
-                        B = layer(B)
-                    elif isinstance(layer, nn.Linear):
-                        B = (layer.weight @ B.transpose(-1,-2)).transpose(-1,-2)
-                    elif isinstance(layer, nn.BatchNorm2d):
-                        B = B * (layer.weight/torch.sqrt(layer.running_var+layer.eps)).view(1,-1,1,1)
-                    elif isinstance(layer, nn.LayerNorm):
-                        B = B * layer.weight/torch.sqrt(self.model.layernorms[i][1]+layer.eps)
-                    elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
-                        pool = self.model.maxpool_indices[i]
-                        batch_indices = torch.arange(current_batch_size, device=self.device).view(-1,1,1,1)
-                        channel_indices = torch.arange(pool.shape[1], device=self.device).view(1,-1,1,1)
-                        row_indices = pool // B.shape[2] if IN_2D else pool
-                        col_indices = pool % B.shape[3]
-                        B = B[batch_indices, channel_indices, row_indices, col_indices]
+                    B = self._linear_step(B, i, layer)
 
                 B = B.reshape(-1, output_size)
                 A[:, start:end] = B.T
@@ -135,27 +163,7 @@ class KnowledgeMatrixComputer:
                         a = self.model.apply_residual(a, inputs_residuals, layer=i)
                     if i in self.model.residuals_starts:
                         inputs_residuals[i] = a
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
-                        pre_act = self.model.pre_acts[i]
-                        post_act = self.model.acts[i]
-                        vertices = post_act / pre_act
-                        vertices = torch.where(
-                            torch.isnan(vertices) | torch.isinf(vertices),
-                            _zero,
-                            vertices
-                        )
-                        a = a * vertices
-                    elif isinstance(layer, (nn.Conv2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.Flatten, nn.Linear)):
-                        a = layer(a)
-                    elif isinstance(layer, nn.LayerNorm):
-                        a = ((a - self.model.layernorms[i][0])/torch.sqrt(self.model.layernorms[i][1]+layer.eps))*layer.weight + layer.bias
-                    elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
-                        pool = self.model.maxpool_indices[i]
-                        batch_indices = torch.arange(pool.shape[0], device=self.device).view(-1,1,1,1)
-                        channel_indices = torch.arange(pool.shape[1], device=self.device).view(1,-1,1,1)
-                        row_indices = pool // a.shape[2] if IN_2D else pool
-                        col_indices = pool % a.shape[3]
-                        a = a[batch_indices, channel_indices, row_indices, col_indices]
+                    a = self._affine_step(a, i, layer)
 
                 a = a.reshape(-1, output_size)
                 return torch.cat((A, a.T), dim=-1)
