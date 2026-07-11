@@ -287,6 +287,9 @@ class NN(nn.Module):
     def positionalencoding(self, d_model: int, max_len: int=5000) -> None:
         self.layers.append(PositionalEncoding(d_model, max_len))
 
+    def learned_positionalencoding(self, max_len: int, d_model: int) -> None:
+        self.layers.append(LearnedPositionalEncoding(max_len, d_model))
+
 
     ### Residual Connections ###
 
@@ -345,10 +348,10 @@ class NN(nn.Module):
         if not self.save:  # Regular forward pass
             layers = self.layers[:-1] if return_penultimate else self.layers
             for i, layer in enumerate(layers[start_layer:], start=start_layer):
+                if i in self.residuals:
+                    x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.residuals_starts:
                     inputs_residuals[i] = x
-                if i in self.residuals: 
-                    x = self.apply_residual(x, inputs_residuals, layer=i)
                 if isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
                     x, _ = layer(x)
                 else:
@@ -363,10 +366,10 @@ class NN(nn.Module):
             self.layernorms: list[torch.Tensor] = [None] * self.get_num_layers()
 
             for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+                if i in self.residuals:
+                    x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.residuals_starts:
                     inputs_residuals[i] = x
-                if i in self.residuals: 
-                    x = self.apply_residual(x, inputs_residuals, layer=i)
                 if isinstance(layer, (nn.Conv2d, nn.BatchNorm2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Linear, nn.Flatten)):
                     x = layer(x)
                 elif isinstance(layer, nn.LayerNorm):
@@ -499,7 +502,7 @@ class NN(nn.Module):
         start_layer = 0
         if isinstance(self.layers[0], nn.Embedding):
             start_layer = 1
-            if isinstance(self.layers[1], PositionalEncoding):
+            if isinstance(self.layers[1], (PositionalEncoding, LearnedPositionalEncoding)):
                 start_layer = 2
         return start_layer
 
@@ -533,6 +536,24 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pe[:, :x.size(1)]
+
+
+class LearnedPositionalEncoding(nn.Module):
+    """
+        Learned positional encoding for decoder-only transformers (e.g. GPT-2).
+
+        Args:
+            max_len (int): The maximum sequence length.
+            d_model (int): The dimension of the model.
+    """
+    def __init__(self, max_len: int, d_model: int) -> None:
+        super().__init__()
+        self.pos_embedding = nn.Embedding(max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(-2)
+        position_ids = torch.arange(seq_len, device=x.device)
+        return x + self.pos_embedding(position_ids)
 
 
 class MultiHeadAttention(nn.Module):
@@ -581,7 +602,8 @@ class MultiHeadAttention(nn.Module):
         scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
 
         if self.mask is not None:
-            scores = scores.masked_fill(self.mask == 0, float("-inf"))
+            mask = self.mask[:T, :T]
+            scores = scores.masked_fill(mask == 0, float("-inf"))
 
         attn = torch.softmax(scores, dim=-1)
         out = attn @ V
