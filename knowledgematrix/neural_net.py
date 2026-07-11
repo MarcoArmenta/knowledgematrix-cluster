@@ -364,12 +364,14 @@ class NN(nn.Module):
             self.acts: list[torch.Tensor] = [None] * self.get_num_layers()
             self.maxpool_indices: list[torch.Tensor] = [None] * self.get_num_layers()
             self.layernorms: list[torch.Tensor] = [None] * self.get_num_layers()
+            self.stream: list = [None] * self.get_num_layers()
 
             for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.residuals_starts:
                     inputs_residuals[i] = x
+                self.stream[i] = x.detach().clone()
                 if isinstance(layer, (nn.Conv2d, nn.BatchNorm2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Linear, nn.Flatten)):
                     x = layer(x)
                 elif isinstance(layer, nn.LayerNorm):
@@ -381,7 +383,12 @@ class NN(nn.Module):
                     self.maxpool_indices[i] = indices
                 elif isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
                     self.pre_acts[i] = x.detach().clone()
-                    x = layer(x)
+                    if isinstance(layer, MultiHeadAttention):
+                        layer.save_pattern = True
+                        x = layer(x)
+                        layer.save_pattern = False
+                    else:
+                        x = layer(x)
                     self.acts[i] = x.detach().clone()
         return x
 
@@ -583,6 +590,9 @@ class MultiHeadAttention(nn.Module):
         self.d_head = d_model // num_heads
         self.mask = mask
 
+        self.save_pattern = False
+        self.attn_pattern = None
+
         self.Q = nn.Linear(d_model, d_model)
         self.K = nn.Linear(d_model, d_model)
         self.V = nn.Linear(d_model, d_model)
@@ -606,6 +616,8 @@ class MultiHeadAttention(nn.Module):
             scores = scores.masked_fill(mask == 0, float("-inf"))
 
         attn = torch.softmax(scores, dim=-1)
+        if self.save_pattern:
+            self.attn_pattern = attn.detach().clone()
         out = attn @ V
         out = out.transpose(2, 3).contiguous().view(batch, B, T, D)
         return self.O(out)
