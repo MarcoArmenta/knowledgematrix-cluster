@@ -52,5 +52,39 @@ class TestPatternSaving(unittest.TestCase):
             self.assertIsNone(m.layers[i].attn_pattern)
 
 
+class TestFrozenPatternMode(unittest.TestCase):
+    def test_t1_frozen_attention_equals_OV_map(self):
+        """T=1: pattern is [[1]] per head, so the frozen probe map must equal O.weight @ V.weight."""
+        m = small_gpt2(seed=1)
+        x = torch.randint(0, 40, (1, 1, 1))          # single token
+        mc = KnowledgeMatrixComputer(m, batch_size=8, attention_mode="frozen_pattern")
+        mc.forward(x)                                  # reference pass populates patterns
+        i = next(j for j, l in enumerate(m.layers) if isinstance(l, MultiHeadAttention))
+        layer = m.layers[i]
+        d = m.d_model
+        B = torch.eye(d).reshape(d, 1, 1, d)           # d probes, shape (batch, C, T, D)
+        out = mc._linear_step(B, i, layer)             # (d, 1, 1, d)
+        got = out.reshape(d, d).T                      # column j = image of e_j
+        want = layer.O.weight @ layer.V.weight
+        self.assertTrue(torch.allclose(got, want, atol=1e-12),
+                        f"max diff {(got - want).abs().max().item()}")
+
+    def test_km_identity_frozen_mode(self):
+        """M·1 = f(x) must hold exactly in frozen_pattern mode too."""
+        for seed, T in [(0, 4), (1, 6), (2, 3)]:
+            m = small_gpt2(seed=seed)
+            x = torch.randint(0, 40, (1, 1, T))
+            mc = KnowledgeMatrixComputer(m, batch_size=16, attention_mode="frozen_pattern")
+            mat = mc.forward(x)
+            out = mc.current_output.reshape(-1)
+            diff = torch.norm(out - mat.sum(1)).item()
+            self.assertLess(diff, 1e-10, f"seed={seed} T={T}: {diff}")
+
+    def test_invalid_mode_rejected(self):
+        m = small_gpt2()
+        with self.assertRaises(ValueError):
+            KnowledgeMatrixComputer(m, attention_mode="perhead")
+
+
 if __name__ == "__main__":
     unittest.main()

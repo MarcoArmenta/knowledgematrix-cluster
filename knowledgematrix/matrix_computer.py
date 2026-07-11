@@ -19,9 +19,13 @@ class KnowledgeMatrixComputer:
     def __init__(
             self,
             model: NN,
-            batch_size:int = 1,
-            device:Union[str, None] = None
+            batch_size: int = 1,
+            device: Union[str, None] = None,
+            attention_mode: str = "monolithic"
         ) -> None:
+        if attention_mode not in ("monolithic", "frozen_pattern"):
+            raise ValueError(f"attention_mode must be 'monolithic' or 'frozen_pattern', got {attention_mode!r}")
+        self.attention_mode = attention_mode
         self.model = model
         self.batch_size = batch_size
         self.layers = model.layers
@@ -35,7 +39,15 @@ class KnowledgeMatrixComputer:
     def _linear_step(self, B: torch.Tensor, i: int, layer) -> torch.Tensor:
         """Probe-pass (weights-only) transform of layer i. Unknown layers
         (Dropout in eval, etc.) pass through unchanged."""
-        if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
+        if isinstance(layer, MultiHeadAttention) and self.attention_mode == "frozen_pattern":
+            pattern = layer.attn_pattern           # (1, 1, H, T, T) from reference pass
+            batch, C, T, D = B.shape
+            v = (layer.V.weight @ B.transpose(-1, -2)).transpose(-1, -2)
+            v = v.view(batch, C, T, layer.num_heads, layer.d_head).transpose(2, 3)
+            out = pattern @ v                      # broadcasts over probe batch
+            out = out.transpose(2, 3).contiguous().view(batch, C, T, D)
+            B = (layer.O.weight @ out.transpose(-1, -2)).transpose(-1, -2)
+        elif isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
             pre_act = self.model.pre_acts[i]
             post_act = self.model.acts[i]
             vertices = post_act / pre_act
@@ -66,7 +78,15 @@ class KnowledgeMatrixComputer:
 
     def _affine_step(self, a: torch.Tensor, i: int, layer) -> torch.Tensor:
         """Bias-pass (full affine) transform of layer i."""
-        if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
+        if isinstance(layer, MultiHeadAttention) and self.attention_mode == "frozen_pattern":
+            pattern = layer.attn_pattern
+            batch, C, T, D = a.shape
+            v = layer.V(a)                         # with bias
+            v = v.view(batch, C, T, layer.num_heads, layer.d_head).transpose(2, 3)
+            out = pattern @ v
+            out = out.transpose(2, 3).contiguous().view(batch, C, T, D)
+            a = layer.O(out)                       # with bias
+        elif isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, MultiHeadAttention)):
             pre_act = self.model.pre_acts[i]
             post_act = self.model.acts[i]
             vertices = post_act / pre_act
