@@ -6,6 +6,32 @@ from torch.nn import functional as F
 from knowledgematrix.neural_net import NN, MultiHeadAttention
 
 
+def compose(m2: torch.Tensor, m1: torch.Tensor) -> torch.Tensor:
+    """Augmented product of two knowledge matrices: the contribution-form KM of
+    the composed segment, exact because both factors are frozen by the same
+    reference pass.
+
+    Knowledge matrices are contribution-form (columns are per-input-dimension
+    contributions, so `M·1 = f(x)`), i.e. `m = A·diag(cut_in) | b`, where the
+    linear columns carry the input activations at the segment's input cut. The
+    shared-cut activations between the two segments are recovered exactly as the
+    row-sums of `m1` (`m1·1 = cut`), which de-scale `m2`'s columns back to the
+    plain affine operator before the product. The result is again contribution
+    form w.r.t. `m1`'s input:
+        [A2·A1·diag(cut_in) | A2·b1 + b2].
+    """
+    cut = m1.sum(1)                             # activations at the shared cut
+    scale = m2[:, :-1] / cut.unsqueeze(0)       # de-scale m2's columns to the affine operator
+    scale = torch.where(
+        torch.isnan(scale) | torch.isinf(scale),
+        torch.zeros_like(scale),
+        scale
+    )
+    lin = scale @ m1[:, :-1]
+    bias = scale @ m1[:, -1] + m2[:, -1]
+    return torch.cat((lin, bias.unsqueeze(-1)), dim=-1)
+
+
 class KnowledgeMatrixComputer:
     """
         A class to compute the knowledge matrix of a neural network.
@@ -187,5 +213,75 @@ class KnowledgeMatrixComputer:
 
                 a = a.reshape(-1, output_size)
                 return torch.cat((A, a.T), dim=-1)
-            
+
             return A
+
+    def segment(self, x: torch.Tensor, start_cut: int, end_cut: int,
+                final_position_only: bool = False) -> torch.Tensor:
+        """KM of layers [start_cut, end_cut) at input x, under the cut-point
+        convention: the residual application AT start_cut belongs upstream (skipped);
+        the residual application AT end_cut belongs to this segment (trailing step).
+        Cut values are residual-stream tensors saved by the reference pass."""
+        n = self.model.get_num_layers()
+        if not (self.model._get_start_layer() <= start_cut < end_cut <= n):
+            raise ValueError(f"invalid cuts ({start_cut}, {end_cut})")
+        if final_position_only and end_cut != n:
+            raise ValueError("final_position_only requires end_cut == num_layers")
+
+        with torch.no_grad():
+            # Reference pass: activations, patterns, LN stats, stream values
+            self.model.save = True
+            self.current_output = self.model.forward(x)
+            self.model.save = False
+            self.model.to(self.device)
+
+            x0 = self.model.stream[start_cut].to(self.device)      # (1, C, T, D)
+            seg_out = self.current_output if end_cut == n else self.model.stream[end_cut]
+            dtype = self.current_output.dtype
+            self._zero = torch.tensor(0.0, device=self.device, dtype=dtype)
+            _, C, H, W = x0.shape
+            self.IN_2D = (W > 1)
+            total_positions = C * H * W
+            out_numel = seg_out.numel()
+            if final_position_only:
+                seq_len = self.current_output.shape[-2]
+                vocab = self.current_output.shape[-1]
+                row_lo, row_hi = (seq_len - 1) * vocab, seq_len * vocab
+            else:
+                row_lo, row_hi = 0, out_numel
+            num_batches = (total_positions + self.batch_size - 1) // self.batch_size
+            A = torch.empty((row_hi - row_lo, total_positions), device=self.device, dtype=dtype)
+
+            def run_probe(P, affine):
+                """Push P through the segment. affine=False: weights-only probe pass;
+                affine=True: full-affine bias pass."""
+                inputs_residuals = [None] * n
+                step = self._affine_step if affine else self._linear_step
+                for i, layer in enumerate(self.layers[start_cut:end_cut], start=start_cut):
+                    if i in self.model.residuals and i > start_cut:
+                        P = self.model.apply_residual(P, inputs_residuals, layer=i, affine=affine)
+                    if i in self.model.residuals_starts:
+                        inputs_residuals[i] = P
+                    P = step(P, i, layer)
+                if end_cut < n and end_cut in self.model.residuals:
+                    P = self.model.apply_residual(P, inputs_residuals, layer=end_cut, affine=affine)
+                return P
+
+            for batch in range(num_batches):
+                start = batch * self.batch_size
+                end = min((batch + 1) * self.batch_size, total_positions)
+                cbs = end - start
+                indices = torch.arange(start, end, device=self.device)
+                c = indices // (H * W)
+                remaining = indices % (H * W)
+                h = remaining // W
+                w = remaining % W
+                B = torch.zeros((cbs, C, H, W), device=self.device, dtype=dtype)
+                B[torch.arange(cbs, device=self.device), c, h, w] = x0.flatten()[start:end]
+                B = run_probe(B, affine=False)
+                A[:, start:end] = B.reshape(cbs, -1)[:, row_lo:row_hi].T
+
+            a = torch.zeros(x0.shape, device=self.device, dtype=dtype)
+            a = run_probe(a, affine=True)
+            a = a.reshape(1, -1)[:, row_lo:row_hi]
+            return torch.cat((A, a.T), dim=-1)

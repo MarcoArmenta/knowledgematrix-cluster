@@ -178,6 +178,18 @@ class GPT2(NN):
         # Output head (lm_head)
         self.layers.append(hf_model.lm_head)
 
+    def block_boundaries(self, sub_blocks: bool = False) -> list:
+        """Cut-point layer indices for segment KMs. Consecutive pairs are the
+        segments: L transformer blocks, then the final LN + lm_head segment."""
+        cuts = []
+        for b in range(self.num_layers):
+            cuts.append(2 + 8 * b)
+            if sub_blocks:
+                cuts.append(5 + 8 * b)
+        cuts.append(2 + 8 * self.num_layers)
+        cuts.append(self.get_num_layers())
+        return cuts
+
     @staticmethod
     def _load_attention_weights(mha: MultiHeadAttention, hf_attn) -> None:
         """
