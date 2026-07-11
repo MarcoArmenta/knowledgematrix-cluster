@@ -3,7 +3,7 @@ from torch import nn
 from typing import Union
 from torch.nn import functional as F
 
-from knowledgematrix.neural_net import NN, MultiHeadAttention
+from knowledgematrix.neural_net import NN, MultiHeadAttention, _ParallelState
 
 
 def compose(m2: torch.Tensor, m1: torch.Tensor) -> torch.Tensor:
@@ -188,7 +188,9 @@ class KnowledgeMatrixComputer:
                 batched_input[torch.arange(current_batch_size, device=self.device),c,h,w] = x.flatten()[start:end]
 
                 B = batched_input
+                pstate = _ParallelState()
                 for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+                    B = self.model.parallel_step(i, B, pstate)
                     if i in self.model.residuals:
                         B = self.model.apply_residual(B, inputs_residuals, layer=i, affine=False)
                     if i in self.model.residuals_starts:
@@ -204,7 +206,9 @@ class KnowledgeMatrixComputer:
                 a = torch.zeros(x.shape, device=self.device, dtype=dtype)
                 if len(x.shape) == 3:
                     a = a.unsqueeze(0)
+                pstate = _ParallelState()
                 for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+                    a = self.model.parallel_step(i, a, pstate)
                     if i in self.model.residuals:
                         a = self.model.apply_residual(a, inputs_residuals, layer=i)
                     if i in self.model.residuals_starts:
@@ -227,6 +231,10 @@ class KnowledgeMatrixComputer:
             raise ValueError(f"invalid cuts ({start_cut}, {end_cut})")
         if final_position_only and end_cut != n:
             raise ValueError("final_position_only requires end_cut == num_layers")
+        for end, (start, mid) in self.model.parallel_blocks.items():
+            for c in (start_cut, end_cut):
+                if start < c < end:
+                    raise ValueError(f"cut {c} falls inside parallel block ({start},{end})")
 
         with torch.no_grad():
             # Reference pass: activations, patterns, LN stats, stream values
@@ -256,8 +264,10 @@ class KnowledgeMatrixComputer:
                 """Push P through the segment. affine=False: weights-only probe pass;
                 affine=True: full-affine bias pass."""
                 inputs_residuals = [None] * n
+                pstate = _ParallelState()
                 step = self._affine_step if affine else self._linear_step
                 for i, layer in enumerate(self.layers[start_cut:end_cut], start=start_cut):
+                    P = self.model.parallel_step(i, P, pstate, seg_start=start_cut)
                     if i in self.model.residuals and i > start_cut:
                         P = self.model.apply_residual(P, inputs_residuals, layer=i, affine=affine)
                     if i in self.model.residuals_starts:
@@ -265,6 +275,8 @@ class KnowledgeMatrixComputer:
                     P = step(P, i, layer)
                 if end_cut < n and end_cut in self.model.residuals:
                     P = self.model.apply_residual(P, inputs_residuals, layer=end_cut, affine=affine)
+                if end_cut < n and end_cut in self.model.parallel_blocks:
+                    P = pstate.saved.pop(end_cut) + pstate.branch1.pop(end_cut) + P
                 return P
 
             for batch in range(num_batches):

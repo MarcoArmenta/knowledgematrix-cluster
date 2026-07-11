@@ -5,6 +5,13 @@ import math
 from typing import Union, Dict, Tuple
 
 
+class _ParallelState:
+    """Per-pass bookkeeping for parallel-residual blocks."""
+    def __init__(self):
+        self.saved = {}
+        self.branch1 = {}
+
+
 class NN(nn.Module):
     """
         A class to build a neural network for which the knowledge matrix can be computed.
@@ -28,6 +35,11 @@ class NN(nn.Module):
         self.layers = nn.ModuleList()
         self.residuals: Dict[int, Tuple[int, list[nn.Module]]] = {}
         self.residuals_starts: set[int] = set()
+        # Parallel residual blocks (GPT-NeoX): end -> (start, mid), meaning
+        # x_end = x_start + branch1(x_start) + branch2(x_start), with branch1 =
+        # layers[start:mid], branch2 = layers[mid:end]. The merge at `end`
+        # happens BEFORE layer `end` runs (same convention as residual ends).
+        self.parallel_blocks: Dict[int, Tuple[int, int]] = {}
 
 
     ### Linear Layers ###
@@ -334,6 +346,23 @@ class NN(nn.Module):
             self.residuals[end] = [(start, projection)]
 
 
+    ### Parallel Residual Blocks ###
+
+    def parallel_step(self, i: int, x, st: "_ParallelState", seg_start: int = -1):
+        """Parallel-residual bookkeeping at loop index i (call BEFORE layer i).
+        The merge at a block end belongs to the upstream segment: it is skipped
+        when i == seg_start (the segment() trailing step applies it instead)."""
+        for end, (start, mid) in self.parallel_blocks.items():
+            if i == start:
+                st.saved[end] = x
+            elif i == mid:
+                st.branch1[end] = x
+                x = st.saved[end]
+            elif i == end and i != seg_start:
+                x = st.saved.pop(end) + st.branch1.pop(end) + x
+        return x
+
+
     ### Forward Method ###
 
     def forward(self, x: torch.Tensor, return_penultimate:bool=False) -> torch.Tensor:
@@ -347,7 +376,9 @@ class NN(nn.Module):
         inputs_residuals: list[torch.Tensor] = [None] * self.get_num_layers()
         if not self.save:  # Regular forward pass
             layers = self.layers[:-1] if return_penultimate else self.layers
+            pstate = _ParallelState()
             for i, layer in enumerate(layers[start_layer:], start=start_layer):
+                x = self.parallel_step(i, x, pstate)
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.residuals_starts:
@@ -366,7 +397,9 @@ class NN(nn.Module):
             self.layernorms: list[torch.Tensor] = [None] * self.get_num_layers()
             self.stream: list = [None] * self.get_num_layers()
 
+            pstate = _ParallelState()
             for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+                x = self.parallel_step(i, x, pstate)
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.residuals_starts:
