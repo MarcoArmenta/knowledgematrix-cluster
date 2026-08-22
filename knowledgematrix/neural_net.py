@@ -363,6 +363,18 @@ class NN(nn.Module):
     def dropout(self, p: float=0.5) -> None:
         self.layers.append(nn.Dropout(p=p))
 
+    def identity(self) -> None:
+        """
+            A no-op layer. Useful as a boundary for residual wiring: a layer
+            index that is simultaneously the end of one residual and the
+            start of the next captures its snapshot BEFORE the addition is
+            applied (starts are snapshotted before ends are applied). In
+            pre-norm architectures (x = x + f(norm(x)) chained), insert an
+            identity after each addition point so the next residual's start
+            index differs from the previous residual's end index.
+        """
+        self.layers.append(nn.Identity())
+
 
     ### Activation Functions ###
 
@@ -432,6 +444,58 @@ class NN(nn.Module):
                 mask=mask
             )
         )
+
+
+    def gatedattention(
+            self,
+            d_model: int,
+            num_heads: int,
+            num_kv_heads: Union[int, None]=None,
+            head_dim: Union[int, None]=None,
+            rope_theta: float=10000.0,
+            partial_rotary_factor: float=0.25,
+            rms_norm_eps: float=1e-6,
+            bias: bool=False,
+            causal: bool=True
+        ) -> None:
+        self.layers.append(
+            GatedAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                rope_theta=rope_theta,
+                partial_rotary_factor=partial_rotary_factor,
+                rms_norm_eps=rms_norm_eps,
+                bias=bias,
+                causal=causal
+            )
+        )
+
+    def gateddeltanet(
+            self,
+            d_model: int,
+            num_v_heads: int,
+            num_k_heads: int,
+            head_k_dim: int=128,
+            head_v_dim: int=128,
+            conv_kernel_size: int=4,
+            rms_norm_eps: float=1e-6
+        ) -> None:
+        self.layers.append(
+            GatedDeltaNet(
+                d_model=d_model,
+                num_v_heads=num_v_heads,
+                num_k_heads=num_k_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                conv_kernel_size=conv_kernel_size,
+                rms_norm_eps=rms_norm_eps
+            )
+        )
+
+    def swiglu(self, d_model: int, d_ff: int, bias: bool=False) -> None:
+        self.layers.append(SwiGLU(d_model=d_model, d_ff=d_ff, bias=bias))
 
 
     ### Positional Encoding ###
@@ -904,7 +968,7 @@ class NN(nn.Module):
                 elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
                     x, indices = layer(x)
                     self.maxpool_indices[i] = indices
-                elif isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, nn.CELU, nn.Hardsigmoid, nn.Hardswish, nn.PReLU, nn.ReLU6, nn.Softplus, MultiHeadAttention)):
+                elif isinstance(layer, ACTIVATION_LAYERS):
                     self.pre_acts[i] = x.detach().clone()
                     x = layer(x)
                     self.acts[i] = x.detach().clone()
@@ -1167,6 +1231,322 @@ class RMSNorm(nn.Module):
         return x * self.weight / rms
    
 
+class RMSNormGated(nn.Module):
+    """
+        RMS normalization followed by a SiLU gate, as used inside the
+        GatedDeltaNet layers of Qwen3-Next / Qwen3.5:
+        out = (x / rms(x)) * weight * silu(z).
+
+        Args:
+            hidden_size (int): The size of the normalized (last) dimension.
+            eps (float): Numerical stability constant added to the mean square.
+    """
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return (x / rms) * self.weight * F.silu(gate)
+
+
+class SwiGLU(nn.Module):
+    """
+        Gated feed-forward network (SwiGLU), the MLP block of LLaMA / Qwen
+        and most post-2023 LLMs:
+        out = down_proj( silu(gate_proj(x)) * up_proj(x) ).
+
+        The whole block maps d_model -> d_model, so the knowledge matrix
+        computation treats it like an activation (elementwise post/pre
+        ratio), exactly as it does for MultiHeadAttention.
+
+        Args:
+            d_model (int): The dimension of the model.
+            d_ff (int): The dimension of the hidden (intermediate) layer.
+            bias (bool): Whether the three projections have a bias.
+    """
+    def __init__(self, d_model: int, d_ff: int, bias: bool = False) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.gate_proj = nn.Linear(d_model, d_ff, bias=bias)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=bias)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class GatedAttention(nn.Module):
+    """
+        Full attention block of Qwen3-Next / Qwen3.5 ("gated attention"):
+        - fused query + output-gate projection (q_proj outputs
+          num_heads * head_dim * 2, split per head into query and gate),
+        - RMS normalization of queries and keys per head (QK-Norm),
+        - partial rotary position embedding (RoPE applied to the first
+          head_dim * partial_rotary_factor dimensions of each head),
+        - grouped-query attention (num_kv_heads < num_heads),
+        - causal masking,
+        - sigmoid output gate before the output projection.
+
+        Matches the reference implementation in Hugging Face transformers
+        (models/qwen3_5, Apache-2.0). The zero-centered RMSNorm weights of
+        the checkpoint ((1 + w) scaling) must be folded into plain weights
+        (w' = 1 + w) when loading, which models/qwen3_5.py does.
+
+        Args:
+            d_model (int): The dimension of the model.
+            num_heads (int): The number of query heads.
+            num_kv_heads (int): The number of key/value heads.
+            head_dim (int): The dimension of each head (need not equal
+                d_model // num_heads in Qwen3.5).
+            rope_theta (float): The RoPE base frequency.
+            partial_rotary_factor (float): The fraction of each head that
+                is rotated by RoPE.
+            rms_norm_eps (float): Epsilon of the q/k RMS normalization.
+            bias (bool): Whether the q/k/v/o projections have a bias.
+            causal (bool): Whether to apply a causal mask.
+    """
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            num_kv_heads: Union[int, None] = None,
+            head_dim: Union[int, None] = None,
+            rope_theta: float = 10000.0,
+            partial_rotary_factor: float = 0.25,
+            rms_norm_eps: float = 1e-6,
+            bias: bool = False,
+            causal: bool = True
+        ) -> None:
+        super().__init__()
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        if num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive.")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads.")
+        if head_dim is None:
+            if d_model % num_heads != 0:
+                raise ValueError("d_model must be divisible by num_heads when head_dim is not given.")
+            head_dim = d_model // num_heads
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.d_head = head_dim
+        self.kv_repeat = num_heads // num_kv_heads
+        self.rope_theta = rope_theta
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
+        if self.rotary_dim % 2 != 0:
+            raise ValueError("head_dim * partial_rotary_factor must be even.")
+        self.causal = causal
+
+        self.q_proj = nn.Linear(d_model, num_heads * head_dim * 2, bias=bias)
+        self.k_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=bias)
+        self.v_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=bias)
+        self.o_proj = nn.Linear(num_heads * head_dim, d_model, bias=bias)
+        self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+
+    def _rope(self, T: int, device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        # cos/sin of shape (T, rotary_dim), computed in float32 like the
+        # reference implementation (or float64 when running in float64).
+        rdt = torch.float64 if dtype == torch.float64 else torch.float32
+        half = self.rotary_dim // 2
+        inv_freq = 1.0 / (
+            self.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=rdt, device=device) / self.rotary_dim)
+        )
+        pos = torch.arange(T, dtype=rdt, device=device)
+        freqs = torch.outer(pos, inv_freq)  # (T, rotary_dim // 2)
+        emb = torch.cat((freqs, freqs), dim=-1)  # (T, rotary_dim)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: (..., T, head_dim); rotate the first rotary_dim dims only.
+        x_rot, x_pass = x[..., :self.rotary_dim], x[..., self.rotary_dim:]
+        x_rot = (x_rot * cos) + (self._rotate_half(x_rot) * sin)
+        return torch.cat((x_rot, x_pass), dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, B, T, D = x.shape
+
+        q = self.q_proj(x).view(batch, B, T, self.num_heads, self.d_head * 2)
+        q, gate = torch.chunk(q, 2, dim=-1)  # per-head split, like the reference
+        gate = gate.reshape(batch, B, T, self.num_heads * self.d_head)
+
+        q = self.q_norm(q).transpose(2, 3)  # (batch, B, H, T, d_head)
+        k = self.k_norm(self.k_proj(x).view(batch, B, T, self.num_kv_heads, self.d_head)).transpose(2, 3)
+        v = self.v_proj(x).view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
+
+        cos, sin = self._rope(T, x.device, x.dtype)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
+
+        if self.kv_repeat > 1:
+            k = k.repeat_interleave(self.kv_repeat, dim=-3)
+            v = v.repeat_interleave(self.kv_repeat, dim=-3)
+
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_head)
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1
+            )
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)
+        out = attn @ v  # (batch, B, H, T, d_head)
+        out = out.transpose(2, 3).contiguous().view(batch, B, T, self.num_heads * self.d_head)
+        out = out * torch.sigmoid(gate)
+        return self.o_proj(out)
+
+
+class GatedDeltaNet(nn.Module):
+    """
+        Linear attention block of Qwen3-Next / Qwen3.5 (Gated DeltaNet):
+        - fused q/k/v projection followed by a short depthwise causal
+          convolution with SiLU,
+        - per-head gated delta rule recurrence over the sequence
+          (decay gate g from a/dt_bias/A_log, write strength beta from b),
+        - RMS normalization gated by silu(z),
+        - output projection.
+
+        Matches the reference implementation in Hugging Face transformers
+        (models/qwen3_5, Apache-2.0), using the recurrent (step-by-step)
+        form of the delta rule. The block maps d_model -> d_model, so the
+        knowledge matrix computation treats it like an activation
+        (elementwise post/pre ratio), as it does for MultiHeadAttention.
+
+        Args:
+            d_model (int): The dimension of the model.
+            num_v_heads (int): The number of value heads.
+            num_k_heads (int): The number of key (and query) heads.
+            head_k_dim (int): The dimension of each key/query head.
+            head_v_dim (int): The dimension of each value head.
+            conv_kernel_size (int): Kernel size of the causal convolution.
+            rms_norm_eps (float): Epsilon of the gated RMS normalization.
+    """
+    def __init__(
+            self,
+            d_model: int,
+            num_v_heads: int,
+            num_k_heads: int,
+            head_k_dim: int = 128,
+            head_v_dim: int = 128,
+            conv_kernel_size: int = 4,
+            rms_norm_eps: float = 1e-6
+        ) -> None:
+        super().__init__()
+        if num_v_heads % num_k_heads != 0:
+            raise ValueError("num_v_heads must be divisible by num_k_heads.")
+
+        self.d_model = d_model
+        self.num_v_heads = num_v_heads
+        self.num_k_heads = num_k_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.key_dim = head_k_dim * num_k_heads
+        self.value_dim = head_v_dim * num_v_heads
+        self.conv_kernel_size = conv_kernel_size
+
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=conv_kernel_size,
+            groups=self.conv_dim,
+            padding=conv_kernel_size - 1,
+        )
+
+        self.dt_bias = nn.Parameter(torch.ones(num_v_heads))
+        A = torch.empty(num_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        self.norm = RMSNormGated(head_v_dim, eps=rms_norm_eps)
+        self.out_proj = nn.Linear(self.value_dim, d_model, bias=False)
+
+        self.in_proj_qkv = nn.Linear(d_model, self.conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(d_model, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(d_model, num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(d_model, num_v_heads, bias=False)
+
+    @staticmethod
+    def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, B, T, D = x.shape
+        # The reference computes the recurrence in float32; keep float64
+        # when the network runs in float64 (this library's exactness tests).
+        cdt = torch.float64 if x.dtype == torch.float64 else torch.float32
+        h = x.reshape(batch * B, T, D)
+
+        mixed_qkv = self.in_proj_qkv(h).transpose(1, 2)  # (N, conv_dim, T)
+        z = self.in_proj_z(h).reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
+        b = self.in_proj_b(h)
+        a = self.in_proj_a(h)
+
+        # Depthwise causal convolution + SiLU.
+        mixed_qkv = F.conv1d(
+            mixed_qkv,
+            weight=self.conv1d.weight,
+            bias=self.conv1d.bias,
+            padding=self.conv_kernel_size - 1,
+            groups=self.conv_dim,
+        )[:, :, :T]
+        mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)  # (N, T, conv_dim)
+
+        query, key, value = torch.split(
+            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        query = query.reshape(batch * B, T, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch * B, T, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -self.A_log.to(cdt).exp() * F.softplus(a.to(cdt) + self.dt_bias.to(cdt))
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        # Gated delta rule, recurrent form (heads to dim 1).
+        query = self._l2norm(query.to(cdt)).transpose(1, 2)
+        key = self._l2norm(key.to(cdt)).transpose(1, 2)
+        value = value.to(cdt).transpose(1, 2)
+        beta = beta.to(cdt).transpose(1, 2)
+        g = g.transpose(1, 2)
+        query = query / math.sqrt(self.head_k_dim)
+
+        N, H = query.shape[0], query.shape[1]
+        state = torch.zeros(N, H, self.head_k_dim, self.head_v_dim, dtype=cdt, device=x.device)
+        core_out = torch.zeros(N, H, T, self.head_v_dim, dtype=cdt, device=x.device)
+        for t in range(T):
+            q_t = query[:, :, t]
+            k_t = key[:, :, t]
+            v_t = value[:, :, t]
+            g_t = g[:, :, t].exp().unsqueeze(-1).unsqueeze(-1)
+            beta_t = beta[:, :, t].unsqueeze(-1)
+
+            state = state * g_t
+            kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+            delta = (v_t - kv_mem) * beta_t
+            state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+            core_out[:, :, t] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+        core_out = core_out.transpose(1, 2).to(x.dtype)  # (N, T, H, head_v_dim)
+        core_out = self.norm(core_out, z)
+        core_out = core_out.reshape(batch, B, T, self.value_dim)
+        return self.out_proj(core_out)
+
+
 class JumpReLU(nn.ReLU):
     """
         JumpReLU activation: z * 1[z > threshold], with per-feature thresholds.
@@ -1303,3 +1683,14 @@ class MultiHeadAttention(nn.Module):
         self.K.train()
         self.V.train()
         self.O.train()
+
+# Layers that the knowledge matrix computation treats as activations:
+# the elementwise post/pre ratio of their saved activations is applied as
+# a diagonal map. Any layer type added here is automatically handled by
+# both NN.forward (save mode) and KnowledgeMatrixComputer.
+ACTIVATION_LAYERS = (
+    nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU,
+    nn.Mish, nn.Softmax, nn.CELU, nn.Hardsigmoid, nn.Hardswish, nn.PReLU,
+    nn.ReLU6, nn.Softplus, MultiHeadAttention, GatedAttention, GatedDeltaNet,
+    SwiGLU,
+)

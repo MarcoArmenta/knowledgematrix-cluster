@@ -3,7 +3,7 @@ from torch import nn
 from typing import Union
 from torch.nn import functional as F
 
-from knowledgematrix.neural_net import NN, MultiHeadAttention, RMSNorm
+from knowledgematrix.neural_net import NN, ACTIVATION_LAYERS, RMSNorm
 
 
 class KnowledgeMatrixComputer:
@@ -112,7 +112,7 @@ class KnowledgeMatrixComputer:
                         B = self.model.apply_concat(B, inputs_residuals, layer=i)
                     if i in self.model.branch_inputs_starts:
                         branch_snapshots[i] = B
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, nn.CELU, nn.Hardsigmoid, nn.Hardswish, nn.PReLU, nn.ReLU6, nn.Softplus, MultiHeadAttention)):
+                    if isinstance(layer, ACTIVATION_LAYERS):
                         # Get activation ratios
                         pre_act = self.model.pre_acts[i]
                         post_act = self.model.acts[i]
@@ -175,7 +175,7 @@ class KnowledgeMatrixComputer:
                         a = self.model.apply_concat(a, inputs_residuals, layer=i)
                     if i in self.model.branch_inputs_starts:
                         branch_snapshots[i] = a
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Mish, nn.Softmax, nn.CELU, nn.Hardsigmoid, nn.Hardswish, nn.PReLU, nn.ReLU6, nn.Softplus, MultiHeadAttention)):
+                    if isinstance(layer, ACTIVATION_LAYERS):
                         pre_act = self.model.pre_acts[i]
                         post_act = self.model.acts[i]
                         vertices = post_act / pre_act
