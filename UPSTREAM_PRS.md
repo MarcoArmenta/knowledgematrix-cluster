@@ -1,18 +1,29 @@
 # Upstream PRs to samueleblanc/knowledgematrix — instructions
 
-**Written 2026-08-22.** Follow this top to bottom when at your computer.
+**Written 2026-08-22; branch prep already executed remotely the same day —
+what's left for you is opening the two PRs on GitHub (§ Step 1 / Step 2) and
+deciding what to do with the fork's `main` (§ Step 0).**
+
 Goal: contribute the Qwen3.5 / interpretability work from the fork branch
 `claude/qwen3.5-knowledge-matrix-uktaf7` upstream, as agreed in the alignment
 study plan (general-purpose library code goes to Samuel's repo; the study
 itself lives in `Neural-Networks-Matrices/alignment/`).
+
+## Already done (2026-08-22, remote session)
+
+- [x] Full test suite run on the tip of the Qwen branch (`1cdb0f9`), CPU:
+      `extra/tests/qwen3_5.py` 14/14 pass **including the HF-parity oracle
+      tests** (transformers 5.15.1), `extra/tests/interpretability.py` 6/6
+      (1 CUDA test skipped — no GPU; that's cluster milestone M1).
+- [x] PR branch **`qwen3.5-model`** pushed at `463ec3a` (first three commits).
+- [x] PR branch **`frozen-rows`** pushed at `1cdb0f9` (all four commits).
 
 ## Current state (verified)
 
 - Upstream `samueleblanc/knowledgematrix` `main` is at **`7ad36db`**
   ("Merge pull request #16 … model-resnet152") — it already contains all
   previously merged fork PRs (#1–#16).
-- This fork's `main` is **behind** upstream (it predates several merges).
-  Sync it first (step 0) so future branches start from the right base.
+- **This fork's `main` has DIVERGED from upstream** — see Step 0.
 - Branch `claude/qwen3.5-knowledge-matrix-uktaf7` is exactly upstream
   `main` + 4 commits, in this order:
 
@@ -32,29 +43,48 @@ each review focused: PR 1 is "a new model family", PR 2 is "new semantics of
 the knowledge matrix computation" — the part that deserves Samuel's closest
 look.
 
-## Step 0 — sync the fork's main with upstream
+## Step 0 — decide what to do with the fork's `main` (needs your judgment)
 
-Either click **"Sync fork"** on github.com/MarcoArmenta/knowledgematrix-cluster,
-or:
+A fast-forward sync is **not possible**: `main` is not merely behind, it has
+diverged. It carries 8 commits of your own that upstream does not have —
 
-```bash
-git remote add upstream https://github.com/samueleblanc/knowledgematrix.git  # once
-git fetch upstream
-git checkout main
-git merge --ff-only upstream/main
-git push origin main
-```
+    e0c8626  implementation for 1d CNNs
+    754404a  device changes
+    178cfc4  device to knowledgematrixcomputer
+    7a842d3  models with transfer learning
+    5c89f7a  allow for more input shapes
+    9fe428c  typo
+    abe73ea  shape error for mnist1d
+    0377a24  residuals module list error when empty
 
-(`--ff-only` must succeed; if it doesn't, stop and check what main has that
-upstream doesn't.)
+— while upstream `main` is 48 commits ahead (all the merged PRs #1–#16,
+including the Qwen3.5 base). Some of your `main` commits are likely
+**superseded** upstream (e.g. `178cfc4` device support vs upstream's
+`dfe900b` "add device choice for KnowledgeMatrixComputer"; 1D conv handling
+vs the merged conv-layers work), others (transfer learning / import-your-own-
+pretrained-model) may still be worth an upstream PR of their own.
+
+The PR branches below do NOT depend on `main`, so this can wait. Options:
+
+- **(a) recommended:** preserve the old main as a work branch, then reset
+  `main` to upstream:
+  ```bash
+  git remote add upstream https://github.com/samueleblanc/knowledgematrix.git
+  git fetch upstream
+  git branch legacy-main origin/main && git push origin legacy-main
+  git checkout main && git reset --hard upstream/main
+  git push --force-with-lease origin main
+  ```
+  Then cherry-pick from `legacy-main` whatever is not superseded, as a future
+  upstream PR.
+- **(b)** merge `upstream/main` into `main` and resolve conflicts by hand
+  (they will be substantial in `neural_net.py`).
+- **(c)** leave `main` alone for now.
 
 ## Step 1 — PR 1: Qwen3.5 model support
 
-```bash
-git fetch origin claude/qwen3.5-knowledge-matrix-uktaf7
-git branch qwen3.5-model 463ec3a          # first three commits only
-git push -u origin qwen3.5-model
-```
+Branch **`qwen3.5-model`** is already pushed at `463ec3a` (first three
+commits only). Just open the PR on GitHub:
 
 Open a PR **from `MarcoArmenta:qwen3.5-model` into `samueleblanc:main`**.
 
@@ -101,14 +131,10 @@ Open a PR **from `MarcoArmenta:qwen3.5-model` into `samueleblanc:main`**.
 
 ## Step 2 — PR 2: frozen-mode linearization + row extraction
 
-Can be pushed immediately, but **open it after PR 1 merges** (its diff
-includes PR 1's commits until then). If you want it visible earlier, open it
-as a **draft** noting it stacks on PR 1.
-
-```bash
-git branch frozen-rows 1cdb0f9            # all four commits
-git push -u origin frozen-rows
-```
+Branch **`frozen-rows`** is already pushed at `1cdb0f9` (all four commits).
+**Open it after PR 1 merges** (its diff includes PR 1's commits until then).
+If you want it visible earlier, open it as a **draft** noting it stacks on
+PR 1.
 
 Open a PR **from `MarcoArmenta:frozen-rows` into `samueleblanc:main`**.
 (If PR 1 merged, GitHub will show only `1cdb0f9` in the diff. If upstream
@@ -150,7 +176,8 @@ main moved, merge it in first — no rebase needed on a shared branch.)
 
 ## Step 3 — after both merge
 
-1. Sync fork `main` again (step 0).
+1. Sync fork `main` with upstream (after resolving Step 0 this becomes a
+   plain fast-forward).
 2. In `Neural-Networks-Matrices`, point `alignment/requirements.txt` at
    upstream instead of the fork branch:
    `knowledgematrix @ git+https://github.com/samueleblanc/knowledgematrix`.
