@@ -15,6 +15,9 @@ setup(
     ],
     extras_require={
         "viz": ["matplotlib>=3.5"],
+        # Only needed to load pretrained LLM weights (e.g. Qwen3.5) through
+        # models/qwen3_5.py::Qwen3_5.from_huggingface.
+        "hf": ["transformers>=5.15"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
