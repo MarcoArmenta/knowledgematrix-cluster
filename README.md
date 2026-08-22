@@ -50,6 +50,22 @@ Note on size: with the language-model head the matrix has
 states (`seq_len * hidden_size` rows); since the head is linear, its rows
 can be pushed through afterwards for the logits you need.
 
+Two primitives for interpretability studies at LLM scale:
+
+* **Cross-token attribution** — by default the token-mixing layers are
+  linearized by the elementwise post/pre activation ratio, which keeps
+  attribution within each token position (the matrix is block diagonal over
+  positions). `KnowledgeMatrixComputer(model, mixer_mode="frozen")` instead
+  applies attention / DeltaNet / SwiGLU as linear maps with their routing
+  (attention weights, recurrence gates, GLU gates) frozen at the actual
+  input: attribution then flows across positions through the value paths.
+  Both modes reproduce the forward pass exactly (`mat.sum(1) == forward`).
+* **Row extraction** — `KnowledgeRowComputer(model).forward(x, rows)`
+  computes selected rows of the knowledge matrix by reverse mode (one
+  vector-Jacobian product per row, about one forward pass each), instead of
+  all columns. This is the efficient direction when a few output rows (e.g.
+  the logits of an answer token) are needed over many input coordinates.
+
 ## Contributing
 
 Any contribution is welcomed. Thank you in advance! 

@@ -1277,6 +1277,22 @@ class SwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+    def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:
+        """
+            Frozen-gate linearization of the block, evaluated at x: the
+            silu(gate_proj) factor is computed from (and frozen at) the
+            actual layer input x0, so the map x -> frozen_forward(x, x0)
+            is LINEAR (through the up_proj path) and equals forward(x0) at
+            x = x0 exactly. Used by KnowledgeMatrixComputer(mixer_mode=
+            "frozen") and KnowledgeRowComputer. With affine=False the
+            up/down projections are applied without their biases (the
+            knowledge matrix column pass).
+        """
+        gate0 = F.silu(self.gate_proj(x0))
+        up_bias = self.up_proj.bias if (affine and self.up_proj.bias is not None) else None
+        down_bias = self.down_proj.bias if (affine and self.down_proj.bias is not None) else None
+        return F.linear(gate0 * F.linear(x, self.up_proj.weight, up_bias), self.down_proj.weight, down_bias)
+
 
 class GatedAttention(nn.Module):
     """
@@ -1407,6 +1423,57 @@ class GatedAttention(nn.Module):
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
+    def _attn_weights(self, x0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+            The attention weights and output gate computed from (and frozen
+            at) the actual layer input x0. Returns (attn, sigmoid(gate)).
+        """
+        batch, B, T, D = x0.shape
+        q = self.q_proj(x0).view(batch, B, T, self.num_heads, self.d_head * 2)
+        q, gate = torch.chunk(q, 2, dim=-1)
+        gate = gate.reshape(batch, B, T, self.num_heads * self.d_head)
+        q = self.q_norm(q).transpose(2, 3)
+        k = self.k_norm(self.k_proj(x0).view(batch, B, T, self.num_kv_heads, self.d_head)).transpose(2, 3)
+        cos, sin = self._rope(T, x0.device, x0.dtype)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
+        if self.kv_repeat > 1:
+            k = k.repeat_interleave(self.kv_repeat, dim=-3)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_head)
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=x0.device), diagonal=1
+            )
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+        return torch.softmax(scores, dim=-1), torch.sigmoid(gate)
+
+    def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:
+        """
+            Frozen-routing linearization of the block, evaluated at x: the
+            attention weights and the output gate are computed from (and
+            frozen at) the actual layer input x0, so the map
+            x -> frozen_forward(x, x0) is LINEAR across positions (through
+            the value path) and equals forward(x0) at x = x0 exactly. Used
+            by KnowledgeMatrixComputer(mixer_mode="frozen") and
+            KnowledgeRowComputer. With affine=False the value/output
+            projections are applied without their biases (the knowledge
+            matrix column pass); biases flow through the affine=True pass.
+        """
+        batch, B, T, D = x.shape
+        attn0, gate0 = self._attn_weights(x0)
+
+        v_bias = self.v_proj.bias if (affine and self.v_proj.bias is not None) else None
+        v = F.linear(x, self.v_proj.weight, v_bias)
+        v = v.view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
+        if self.kv_repeat > 1:
+            v = v.repeat_interleave(self.kv_repeat, dim=-3)
+
+        out = attn0 @ v  # (1,1,H,T,T) broadcast against (batch,B,H,T,d_head)
+        out = out.transpose(2, 3).reshape(batch, B, T, self.num_heads * self.d_head)
+        out = out * gate0
+        o_bias = self.o_proj.bias if (affine and self.o_proj.bias is not None) else None
+        return F.linear(out, self.o_proj.weight, o_bias)
+
 
 class GatedDeltaNet(nn.Module):
     """
@@ -1482,19 +1549,13 @@ class GatedDeltaNet(nn.Module):
     def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, B, T, D = x.shape
-        # The reference computes the recurrence in float32; keep float64
-        # when the network runs in float64 (this library's exactness tests).
-        cdt = torch.float64 if x.dtype == torch.float64 else torch.float32
-        h = x.reshape(batch * B, T, D)
-
+    def _conv_silu_qkv(self, h: torch.Tensor, pre_activation: bool = False) -> torch.Tensor:
+        """
+            Fused q/k/v projection + depthwise causal convolution (+ SiLU
+            unless pre_activation). h: (N, T, d_model) -> (N, T, conv_dim).
+        """
+        T = h.shape[1]
         mixed_qkv = self.in_proj_qkv(h).transpose(1, 2)  # (N, conv_dim, T)
-        z = self.in_proj_z(h).reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(h)
-        a = self.in_proj_a(h)
-
-        # Depthwise causal convolution + SiLU.
         mixed_qkv = F.conv1d(
             mixed_qkv,
             weight=self.conv1d.weight,
@@ -1502,32 +1563,36 @@ class GatedDeltaNet(nn.Module):
             padding=self.conv_kernel_size - 1,
             groups=self.conv_dim,
         )[:, :, :T]
-        mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)  # (N, T, conv_dim)
+        if not pre_activation:
+            mixed_qkv = F.silu(mixed_qkv)
+        return mixed_qkv.transpose(1, 2)  # (N, T, conv_dim)
 
-        query, key, value = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-        )
-        query = query.reshape(batch * B, T, self.num_k_heads, self.head_k_dim)
-        key = key.reshape(batch * B, T, self.num_k_heads, self.head_k_dim)
-        value = value.reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.to(cdt).exp() * F.softplus(a.to(cdt) + self.dt_bias.to(cdt))
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # Gated delta rule, recurrent form (heads to dim 1).
+    def _delta_rule(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            cdt: torch.dtype
+        ) -> torch.Tensor:
+        """
+            Gated delta rule, recurrent form. query/key: (Nq, T, H, d_k),
+            value: (N, T, H, d_v), g/beta: (Nq, T, H); Nq may be 1 while N
+            is a batch (broadcast, used by the frozen linearization).
+            Returns (N, T, H, d_v) in dtype cdt.
+        """
+        T = value.shape[1]
         query = self._l2norm(query.to(cdt)).transpose(1, 2)
         key = self._l2norm(key.to(cdt)).transpose(1, 2)
         value = value.to(cdt).transpose(1, 2)
         beta = beta.to(cdt).transpose(1, 2)
-        g = g.transpose(1, 2)
+        g = g.to(cdt).transpose(1, 2)
         query = query / math.sqrt(self.head_k_dim)
 
-        N, H = query.shape[0], query.shape[1]
-        state = torch.zeros(N, H, self.head_k_dim, self.head_v_dim, dtype=cdt, device=x.device)
-        core_out = torch.zeros(N, H, T, self.head_v_dim, dtype=cdt, device=x.device)
+        N, H = value.shape[0], value.shape[1]
+        state = torch.zeros(N, H, self.head_k_dim, self.head_v_dim, dtype=cdt, device=value.device)
+        core_out = torch.zeros(N, H, T, self.head_v_dim, dtype=cdt, device=value.device)
         for t in range(T):
             q_t = query[:, :, t]
             k_t = key[:, :, t]
@@ -1541,10 +1606,87 @@ class GatedDeltaNet(nn.Module):
             state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             core_out[:, :, t] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
-        core_out = core_out.transpose(1, 2).to(x.dtype)  # (N, T, H, head_v_dim)
+        return core_out.transpose(1, 2)  # (N, T, H, d_v)
+
+    def _routing(self, h: torch.Tensor, cdt: torch.dtype, qkv: Union[torch.Tensor, None] = None):
+        """
+            The recurrence inputs computed from h: (N, T, d_model).
+            Returns (query, key, g, beta) with the kv grouping expanded.
+        """
+        T = h.shape[1]
+        if qkv is None:
+            qkv = self._conv_silu_qkv(h)
+        query = qkv[..., :self.key_dim]
+        key = qkv[..., self.key_dim:2 * self.key_dim]
+        query = query.reshape(-1, T, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(-1, T, self.num_k_heads, self.head_k_dim)
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        beta = self.in_proj_b(h).sigmoid()
+        g = -self.A_log.to(cdt).exp() * F.softplus(self.in_proj_a(h).to(cdt) + self.dt_bias.to(cdt))
+        return query, key, g, beta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, B, T, D = x.shape
+        # The reference computes the recurrence in float32; keep float64
+        # when the network runs in float64 (this library's exactness tests).
+        cdt = torch.float64 if x.dtype == torch.float64 else torch.float32
+        h = x.reshape(batch * B, T, D)
+
+        z = self.in_proj_z(h).reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
+        qkv = self._conv_silu_qkv(h)
+        value = qkv[..., 2 * self.key_dim:].reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
+        query, key, g, beta = self._routing(h, cdt, qkv=qkv)
+
+        core_out = self._delta_rule(query, key, value, g, beta, cdt).to(x.dtype)
         core_out = self.norm(core_out, z)
         core_out = core_out.reshape(batch, B, T, self.value_dim)
         return self.out_proj(core_out)
+
+    def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:
+        """
+            Frozen-routing linearization of the block, evaluated at x: the
+            recurrence inputs q, k and the gates g, beta, the conv-SiLU
+            activation ratio of the value path, the gate silu(z) and the
+            output RMS are all computed from (and frozen at) the actual
+            layer input x0, so the map x -> frozen_forward(x, x0) is LINEAR
+            across positions and channels, and equals forward(x0) at
+            x = x0 exactly. Used by KnowledgeMatrixComputer(mixer_mode=
+            "frozen") and KnowledgeRowComputer. All projections of this
+            block are bias-free, so `affine` has no effect; it is accepted
+            for interface uniformity with the other linearizable layers.
+        """
+        batch, B, T, D = x.shape
+        cdt = torch.float64 if x.dtype == torch.float64 else torch.float32
+        h = x.reshape(batch * B, T, D)
+        h0 = x0.reshape(-1, T, D)
+
+        # Frozen routing and gates from x0.
+        pre0_full = self._conv_silu_qkv(h0, pre_activation=True)
+        query0, key0, g0, beta0 = self._routing(h0, cdt, qkv=F.silu(pre0_full))
+        z0 = self.in_proj_z(h0).reshape(-1, T, self.num_v_heads, self.head_v_dim)
+        gate0 = F.silu(z0)
+
+        # Value path of x, with the conv SiLU replaced by its (frozen)
+        # activation ratio at x0 -- exact at x0, linear in x. At a
+        # coordinate where the pre-activation vanishes the ratio is the
+        # limit silu'(0) = 1/2 (the actual value there is 0 either way).
+        pre0 = pre0_full[..., 2 * self.key_dim:]
+        ratio0 = torch.where(pre0 == 0, torch.full_like(pre0, 0.5), F.silu(pre0) / pre0)
+        pre = self._conv_silu_qkv(h, pre_activation=True)[..., 2 * self.key_dim:]
+        value = (ratio0 * pre).reshape(batch * B, T, self.num_v_heads, self.head_v_dim)
+
+        # Frozen recurrence (linear in the values), and the frozen output
+        # normalization: RMS taken from the actual output at x0.
+        core = self._delta_rule(query0, key0, value, g0, beta0, cdt).to(x.dtype)
+        value0 = F.silu(pre0).reshape(-1, T, self.num_v_heads, self.head_v_dim)
+        core0 = self._delta_rule(query0, key0, value0, g0, beta0, cdt).to(x.dtype)
+        rms0 = torch.sqrt(torch.mean(core0 ** 2, dim=-1, keepdim=True) + self.norm.eps)
+
+        core = (core / rms0) * self.norm.weight * gate0
+        core = core.reshape(batch, B, T, self.value_dim)
+        return self.out_proj(core)
 
 
 class JumpReLU(nn.ReLU):
@@ -1694,3 +1836,14 @@ ACTIVATION_LAYERS = (
     nn.ReLU6, nn.Softplus, MultiHeadAttention, GatedAttention, GatedDeltaNet,
     SwiGLU,
 )
+
+# Layers that additionally support the frozen-routing linearization
+# (frozen_forward): with KnowledgeMatrixComputer(mixer_mode="frozen") or
+# KnowledgeRowComputer, these are applied as linear maps with their
+# routing (attention weights, recurrence gates, GLU gates) frozen at the
+# actual input, instead of the elementwise post/pre ratio. The frozen map
+# still reproduces the layer output exactly at the actual input, so the
+# knowledge matrix row-sum invariant is preserved -- but attribution can
+# flow ACROSS token positions through the value paths, which the ratio
+# treatment (a diagonal map) cannot express.
+LINEARIZABLE_LAYERS = (GatedAttention, GatedDeltaNet, SwiGLU)

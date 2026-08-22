@@ -3,7 +3,7 @@ from torch import nn
 from typing import Union
 from torch.nn import functional as F
 
-from knowledgematrix.neural_net import NN, ACTIVATION_LAYERS, RMSNorm
+from knowledgematrix.neural_net import NN, ACTIVATION_LAYERS, LINEARIZABLE_LAYERS, RMSNorm
 
 
 class KnowledgeMatrixComputer:
@@ -14,17 +14,31 @@ class KnowledgeMatrixComputer:
             model (NN): The neural network to compute the knowledge matrix of.
             batch_size (int): The batch size to use when computing the knowledge matrix.
             device (Union[str, None]): The device to use when computing the knowledge matrix. If None, the device of the model is used.
+            mixer_mode (str): How token-mixing / gated layers (GatedAttention,
+                GatedDeltaNet, SwiGLU) are linearized. "ratio" (default)
+                applies the elementwise post/pre activation ratio, like any
+                other activation -- attribution then stays within each token
+                position (the matrix is block diagonal over positions).
+                "frozen" applies each such layer as a linear map with its
+                routing (attention weights, recurrence gates, GLU gates)
+                frozen at the actual input -- attribution then flows across
+                positions through the value paths. Both modes reproduce the
+                forward pass exactly (mat.sum(1) == forward).
     """
 
     def __init__(
             self,
             model: NN,
             batch_size:int = 1,
-            device:Union[str, None] = None
+            device:Union[str, None] = None,
+            mixer_mode:str = "ratio"
         ) -> None:
+        if mixer_mode not in ("ratio", "frozen"):
+            raise ValueError(f'mixer_mode must be "ratio" or "frozen", got {mixer_mode!r}.')
         self.model = model
         self.batch_size = batch_size
         self.layers = model.layers
+        self.mixer_mode = mixer_mode
         self.device = device if device is not None else model.device
         self.in_c, self.in_h, self.in_w = model.input_shape
         self.input_size = self.in_c*self.in_h*self.in_w
@@ -112,7 +126,9 @@ class KnowledgeMatrixComputer:
                         B = self.model.apply_concat(B, inputs_residuals, layer=i)
                     if i in self.model.branch_inputs_starts:
                         branch_snapshots[i] = B
-                    if isinstance(layer, ACTIVATION_LAYERS):
+                    if self.mixer_mode == "frozen" and isinstance(layer, LINEARIZABLE_LAYERS):
+                        B = layer.frozen_forward(B, self.model.pre_acts[i], affine=False)
+                    elif isinstance(layer, ACTIVATION_LAYERS):
                         # Get activation ratios
                         pre_act = self.model.pre_acts[i]
                         post_act = self.model.acts[i]
@@ -175,7 +191,9 @@ class KnowledgeMatrixComputer:
                         a = self.model.apply_concat(a, inputs_residuals, layer=i)
                     if i in self.model.branch_inputs_starts:
                         branch_snapshots[i] = a
-                    if isinstance(layer, ACTIVATION_LAYERS):
+                    if self.mixer_mode == "frozen" and isinstance(layer, LINEARIZABLE_LAYERS):
+                        a = layer.frozen_forward(a, self.model.pre_acts[i], affine=True)
+                    elif isinstance(layer, ACTIVATION_LAYERS):
                         pre_act = self.model.pre_acts[i]
                         post_act = self.model.acts[i]
                         vertices = post_act / pre_act
