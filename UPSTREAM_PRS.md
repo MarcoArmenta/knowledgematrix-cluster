@@ -81,10 +81,39 @@ The PR branches below do NOT depend on `main`, so this can wait. Options:
   (they will be substantial in `neural_net.py`).
 - **(c)** leave `main` alone for now.
 
-## Step 1 — PR 1: Qwen3.5 model support
+## ⚠ Collision check (2026-08-24) — read before opening PR 1
 
-Branch **`qwen3.5-model`** is already pushed at `463ec3a` (first three
-commits only). Just open the PR on GitHub:
+Upstream has **2 open PRs, both yours**, checked against this plan:
+
+- **#12 GradientMatrixComputer** (new file `gradient_matrix.py`, full matrix
+  via jacrev, piecewise-linear nets only): **no conflict** with anything
+  here. It is complementary to PR 2's `KnowledgeRowComputer` (full matrix ×
+  PL nets vs selected rows × transformer nets); PR 2's description should
+  cite it (added below).
+- **#17 SwiGLU** (gated product `act(gate_proj)⊙value_proj`, no
+  down-projection, `alpha` convex attribution split in the KM): **collides
+  with PR 1**, which defines a *different* class of the same name in the
+  same file (the full LLaMA FFN treated as an activation layer). Note the
+  math: frozen mode's treatment of the GLU product is exactly #17's α=0
+  split, so #17 generalizes the Qwen treatment of the product.
+
+**Revised order — do NOT open PR 1 as currently pushed:**
+
+1. Get **#17 merged first** (it is older and has been through review). Ping
+   Samuel if it is stalled.
+2. Then rework the `qwen3.5-model` branch to **compose** #17's `SwiGLU` +
+   a separate down-projection `Linear` for the Qwen FFN (the composition
+   #17's docstring explicitly anticipates), instead of defining a second
+   SwiGLU class — or, if composition changes KM semantics undesirably for
+   ratio mode, rename the Qwen block (`GatedFFN`) and say in the PR why
+   both exist. Claude can do this rework once #17's merged form is fixed.
+3. #12 can merge any time; it does not interact.
+
+## Step 1 — PR 1: Qwen3.5 model support (HOLD until #17 resolves — see above)
+
+Branch **`qwen3.5-model`** is pushed at `463ec3a` (first three commits) but
+needs the SwiGLU rework described in the collision check before opening.
+After the rework:
 
 Open a PR **from `MarcoArmenta:qwen3.5-model` into `samueleblanc:main`**.
 
@@ -168,6 +197,13 @@ main moved, merge it in first — no rebase needed on a shared branch.)
 > Rows agree with `KnowledgeMatrixComputer` to machine precision in both
 > modes (tested). Scope: transformer-style models; conv/pool models raise
 > `NotImplementedError`.
+>
+> Complementary to #12 (`GradientMatrixComputer`): that PR computes the
+> **full** matrix as gradient×input for **piecewise-linear** nets (where the
+> Jacobian and the KM slopes coincide); this one computes **selected rows**
+> for **transformer-style** nets over the frozen linear graph (where they
+> don't — the frozen map excludes gate derivatives by design, preserving
+> the row-sum invariant instead).
 >
 > Motivation: this is the workhorse of an alignment-benchmarking study on
 > Qwen3.5-4B (per-prompt "contrast rows" decomposing the margin between
