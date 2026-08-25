@@ -210,6 +210,33 @@ main moved, merge it in first — no rebase needed on a shared branch.)
 > aligned and misaligned next tokens over the embedded input) — happy to
 > share details.
 
+## Step 2b — PR 3: frozen mode for MultiHeadAttention (stacked on PR 2)
+
+Branch **`frozen-mha`** is pushed at `6328b43` (one commit on top of
+`frozen-rows`). Open **after PR 2 merges** (until then its diff shows the
+whole stack), from `MarcoArmenta:frozen-mha` into `samueleblanc:main`.
+
+**Title:** `Frozen-routing linearization for MultiHeadAttention`
+
+**Description (paste):**
+
+> Extends `mixer_mode="frozen"` to classic softmax attention:
+> `MultiHeadAttention` gains `frozen_forward(x, x0)` mirroring
+> `GatedAttention` — the softmax attention weights (with GQA/MQA and the
+> optional mask) are computed from and frozen at the actual layer input,
+> and `x` flows linearly through the value/output projections. Equals
+> `forward(x0)` at `x = x0` exactly, so the row-sum invariant is
+> preserved; classic transformers now get **cross-position attribution**
+> under frozen mode and `KnowledgeRowComputer`, instead of the
+> block-diagonal ratio treatment. The default `"ratio"` mode is
+> byte-unchanged (regression-tested).
+>
+> Tests (`extra/tests/frozen_mha.py`, torch-only, float64): exactness at
+> x0 incl. GQA/MQA and causal mask; linearity of the frozen map; exact
+> zeros above the diagonal under a causal mask and nonzero cross-position
+> blocks without one; Transformer row-sum invariant in frozen mode;
+> row/matrix agreement; ratio-mode regression.
+
 ## Step 3 — after both merge
 
 1. Sync fork `main` with upstream (after resolving Step 0 this becomes a
