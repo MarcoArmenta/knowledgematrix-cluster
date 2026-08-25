@@ -1814,6 +1814,44 @@ class MultiHeadAttention(nn.Module):
         out = out.transpose(2, 3).contiguous().view(batch, B, T, D)
         return self.O(out)
 
+    def _attn_weights(self, x0: torch.Tensor) -> torch.Tensor:
+        """The softmax attention weights at the actual input x0."""
+        batch, B, T, D = x0.shape
+        Q = self.Q(x0).view(batch, B, T, self.num_heads, self.d_head).transpose(2, 3)
+        K = self.K(x0).view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
+        if self.kv_repeat > 1:
+            K = K.repeat_interleave(self.kv_repeat, dim=-3)
+        scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
+        if self.mask is not None:
+            scores = scores.masked_fill(self.mask == 0, float("-inf"))
+        return torch.softmax(scores, dim=-1)
+
+    def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:
+        """
+            Frozen-routing linearization of the block, evaluated at x: the
+            softmax attention weights are computed from (and frozen at) the
+            actual layer input x0, so the map x -> frozen_forward(x, x0) is
+            LINEAR across positions (through the value path) and equals
+            forward(x0) at x = x0 exactly. Used by
+            KnowledgeMatrixComputer(mixer_mode="frozen") and
+            KnowledgeRowComputer. With affine=False the value/output
+            projections are applied without their biases (the knowledge
+            matrix column pass); biases flow through the affine=True pass.
+        """
+        batch, B, T, D = x.shape
+        attn0 = self._attn_weights(x0)
+
+        v_bias = self.V.bias if (affine and self.V.bias is not None) else None
+        v = F.linear(x, self.V.weight, v_bias)
+        v = v.view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
+        if self.kv_repeat > 1:
+            v = v.repeat_interleave(self.kv_repeat, dim=-3)
+
+        out = attn0 @ v  # (1,1,H,T,T) broadcast against (batch,B,H,T,d_head)
+        out = out.transpose(2, 3).reshape(batch, B, T, self.num_heads * self.d_head)
+        o_bias = self.O.bias if (affine and self.O.bias is not None) else None
+        return F.linear(out, self.O.weight, o_bias)
+
     def eval(self) -> None:
         self.Q.eval()
         self.K.eval()
@@ -1846,4 +1884,4 @@ ACTIVATION_LAYERS = (
 # knowledge matrix row-sum invariant is preserved -- but attribution can
 # flow ACROSS token positions through the value paths, which the ratio
 # treatment (a diagonal map) cannot express.
-LINEARIZABLE_LAYERS = (GatedAttention, GatedDeltaNet, SwiGLU)
+LINEARIZABLE_LAYERS = (MultiHeadAttention, GatedAttention, GatedDeltaNet, SwiGLU)
