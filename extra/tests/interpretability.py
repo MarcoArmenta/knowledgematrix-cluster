@@ -136,7 +136,7 @@ class TestGPU(unittest.TestCase):
     def test_frozen_invariant_and_rows_on_cuda(self):
         model = tiny_model(device="cuda")
         T, V = 7, 50
-        x = torch.randint(0, 50, (1, 1, T))
+        x = torch.randint(0, 50, (1, 1, T), device="cuda")
         forward_pass = model.forward(x)
         model.save = True
         mat = KnowledgeMatrixComputer(model, batch_size=16, mixer_mode="frozen").forward(x)
