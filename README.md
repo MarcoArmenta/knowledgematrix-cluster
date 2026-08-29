@@ -23,6 +23,49 @@ pip install git+https://github.com/samueleblanc/knowledgematrix.git
 
 For an example on how to use, please refer to [example.py](example.py).
 
+## Large language models (Qwen3.5)
+
+The library supports the hybrid Qwen3.5 / Qwen3-Next decoder architecture
+(Gated DeltaNet linear attention, gated full attention with QK-Norm and
+partial RoPE, SwiGLU, RMSNorm). Pretrained weights are loaded through the
+optional dependency [transformers](https://github.com/huggingface/transformers)
+(`pip install "knowledgematrix[hf]"`):
+
+```python
+from transformers import AutoTokenizer
+from knowledgematrix.models.qwen3_5 import Qwen3_5
+from knowledgematrix.matrix_computer import KnowledgeMatrixComputer
+
+model = Qwen3_5.from_huggingface("Qwen/Qwen3.5-4B")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
+
+x = tokenizer("Hello world", return_tensors="pt").input_ids.unsqueeze(0)  # (1, 1, seq_len)
+computer = KnowledgeMatrixComputer(model, batch_size=32)
+mat = computer.forward(x)  # (seq_len * vocab_size, seq_len * hidden_size + 1)
+```
+
+Note on size: with the language-model head the matrix has
+`seq_len * vocab_size` rows, which is very large for a 4B model. Pass
+`include_lm_head=False` to `from_huggingface` to stop at the final hidden
+states (`seq_len * hidden_size` rows); since the head is linear, its rows
+can be pushed through afterwards for the logits you need.
+
+Two primitives for interpretability studies at LLM scale:
+
+* **Cross-token attribution** — by default the token-mixing layers are
+  linearized by the elementwise post/pre activation ratio, which keeps
+  attribution within each token position (the matrix is block diagonal over
+  positions). `KnowledgeMatrixComputer(model, mixer_mode="frozen")` instead
+  applies attention / DeltaNet / SwiGLU as linear maps with their routing
+  (attention weights, recurrence gates, GLU gates) frozen at the actual
+  input: attribution then flows across positions through the value paths.
+  Both modes reproduce the forward pass exactly (`mat.sum(1) == forward`).
+* **Row extraction** — `KnowledgeRowComputer(model).forward(x, rows)`
+  computes selected rows of the knowledge matrix by reverse mode (one
+  vector-Jacobian product per row, about one forward pass each), instead of
+  all columns. This is the efficient direction when a few output rows (e.g.
+  the logits of an answer token) are needed over many input coordinates.
+
 ## Contributing
 
 Any contribution is welcomed. Thank you in advance! 

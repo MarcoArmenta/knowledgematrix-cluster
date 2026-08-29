@@ -3,7 +3,7 @@ from torch import nn
 from typing import Union
 from torch.nn import functional as F
 
-from knowledgematrix.neural_net import NN
+from knowledgematrix.neural_net import NN, ACTIVATION_LAYERS, LINEARIZABLE_LAYERS, RMSNorm
 
 
 class KnowledgeMatrixComputer:
@@ -13,162 +13,231 @@ class KnowledgeMatrixComputer:
         Args:
             model (NN): The neural network to compute the knowledge matrix of.
             batch_size (int): The batch size to use when computing the knowledge matrix.
+            device (Union[str, None]): The device to use when computing the knowledge matrix. If None, the device of the model is used.
+            mixer_mode (str): How token-mixing / gated layers (GatedAttention,
+                GatedDeltaNet, SwiGLU) are linearized. "ratio" (default)
+                applies the elementwise post/pre activation ratio, like any
+                other activation -- attribution then stays within each token
+                position (the matrix is block diagonal over positions).
+                "frozen" applies each such layer as a linear map with its
+                routing (attention weights, recurrence gates, GLU gates)
+                frozen at the actual input -- attribution then flows across
+                positions through the value paths. Both modes reproduce the
+                forward pass exactly (mat.sum(1) == forward).
     """
 
     def __init__(
             self,
             model: NN,
-            batch_size: int = 1,
-            device: str = 'cpu'
+            batch_size:int = 1,
+            device:Union[str, None] = None,
+            mixer_mode:str = "ratio"
         ) -> None:
+        if mixer_mode not in ("ratio", "frozen"):
+            raise ValueError(f'mixer_mode must be "ratio" or "frozen", got {mixer_mode!r}.')
         self.model = model
         self.batch_size = batch_size
         self.layers = model.layers
-        self.device = device
-        if type(model.input_shape) == int:
-            self.input_size = model.input_shape
-            self.in_c = 1
-            self.in_h = model.input_shape
-            self.in_w = 1
-        elif len(model.input_shape) == 2:
-            self.in_c, self.in_w = model.input_shape
+        self.mixer_mode = mixer_mode
+        self.device = device if device is not None else model.device
+        # input_shape may be 1-D (a bare feature count, e.g. MNIST-1D), 2-D
+        # (channels, length -- 1-D convolutional nets) or the 3-D image
+        # (channels, height, width). Normalize to (C, H, W) with singleton
+        # axes so the batched column construction below is shape-agnostic.
+        shape = model.input_shape
+        if isinstance(shape, int):
+            self.in_c, self.in_h, self.in_w = 1, shape, 1
+        elif len(shape) == 1:
+            self.in_c, self.in_h, self.in_w = 1, int(shape[0]), 1
+        elif len(shape) == 2:
+            self.in_c, self.in_w = (int(v) for v in shape)
             self.in_h = 1
-            self.input_size = self.in_c * self.in_h * self.in_w
-        elif len(model.input_shape) == 3:
-            self.in_c, self.in_h, self.in_w = model.input_shape
-            self.input_size = self.in_c * self.in_h * self.in_w
+        elif len(shape) == 3:
+            self.in_c, self.in_h, self.in_w = (int(v) for v in shape)
         else:
-            raise ValueError(f"Non supported shape {model.input_shape}")
+            raise ValueError(
+                f"input_shape must have 1, 2 or 3 dimensions, got {shape!r}.")
+        self.input_size = self.in_c*self.in_h*self.in_w
 
         # Saves the output of the NN on the current sample in the forward method
         self.current_output: Union[NN, None] = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, extract_weff: bool = False) -> torch.Tensor:
         """
             Computes the knowledge matrix of a NN at a given input point.
             Args:
                 x (torch.Tensor): The input to the NN
+                extract_weff (bool): If True, return W_eff[j, i] = df[j]/dx_i
+                    (the local linearization slope) of shape
+                    (output_size, input_size). If False (default), return the
+                    standard knowledge matrix A with A[j, i] = W_eff[j, i] * x_i
+                    and an appended bias column of shape
+                    (output_size, input_size + 1). W_eff is exact only within
+                    the activation region of x (ReLU-family sign patterns and
+                    MaxPool argmax indices); re-extract after perturbations
+                    that cross region boundaries.
             Returns:
-                torch.Tensor: The knowledge matrix of the NN at the input point
+                torch.Tensor: The knowledge matrix A (default) or slope W_eff
+                    (extract_weff=True) of the NN at the input point.
         """
         with torch.no_grad():
             # Saves activations and pre-activations
             self.model.save = True
             self.current_output = self.model.forward(x)
             self.model.save = False
+            self.model.to(self.device)
+            start_layer = self.model._get_start_layer()
+            for layer in self.model.layers[:start_layer]:
+                x = layer(x)
+            if start_layer > 0:
+                C, H, W = x.shape[1], x.shape[2], x.shape[3]
+            else:
+                C, H, W = x.shape[0], x.shape[1], x.shape[2]
 
             # Total number of positions and batches needed
-            C, H, W = self.in_c, self.in_h, self.in_w
-            total_positions = C * H * W
-            num_batches = (total_positions + self.batch_size - 1) // self.batch_size
+            total_positions = C*H*W
+            num_batches = (total_positions + self.batch_size - 1)//self.batch_size
+            output_size = self.current_output.numel()
+            dtype = self.current_output.dtype
 
-            A = torch.Tensor().to(self.device)  # Will become the matrix M(W,f)(x)
+            IN_2D = (W > 1)  # Wether the input is of shape (C,H,W) or (C,L,1)
+
+            x = x.to(self.device)
+            _zero = torch.tensor(0.0, device=self.device, dtype=dtype)
+            inputs_residuals = [None] * self.model.get_num_layers()
+            branch_snapshots = [None] * self.model.get_num_layers()
+            A = torch.empty((output_size, total_positions), device=self.device, dtype=dtype)
+
             for batch in range(num_batches):
-                print(f"A {batch} shape: ", A.shape, flush=True)
                 # Compute batch indices
-                self.model = self.model.to(self.device)
                 start = batch * self.batch_size
                 end = min((batch + 1) * self.batch_size, total_positions)
                 current_batch_size = end - start
 
                 # Create indices for this batch
                 indices = torch.arange(start, end, device=self.device)
-                c = indices // (H * W)
-                remaining = indices % (H * W)
+                c = indices // (H*W)
+                remaining = indices % (H*W)
                 h = remaining // W
                 w = remaining % W
 
                 # Create batched input for this chunk
-                batched_input = torch.zeros((current_batch_size, C, H, W), device=self.device)
-                batched_input[torch.arange(current_batch_size).to(self.device), c, h, w] = x.flatten()[start:end].to(
-                    self.device)
+                batched_input = torch.zeros((current_batch_size,C,H,W), device=self.device, dtype=dtype)
+                if extract_weff:
+                    batched_input[torch.arange(current_batch_size, device=self.device),c,h,w] = 1.0
+                else:
+                    batched_input[torch.arange(current_batch_size, device=self.device),c,h,w] = x.flatten()[start:end]
 
                 B = batched_input
-                inputs_residuals = [None] * self.model.get_num_layers()
-                for i, layer in enumerate(self.layers):
+                for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
                     # Process each layer type (Conv2d, AvgPool2d, Linear, BatchNorm2d, MaxPool2d, etc.)
                     # applying the appropriate transformations and handling activation ratios
-                    if i in self.model.residuals_starts:
-                        inputs_residuals[i] = B.detach().clone()
+                    if i in self.model.residuals_starts or i in self.model.concat_skips_starts:
+                        inputs_residuals[i] = B
+                    if i in self.model.branch_inputs:
+                        B = branch_snapshots[self.model.branch_inputs[i]]
                     if i in self.model.residuals:
                         B = self.model.apply_residual(B, inputs_residuals, layer=i, affine=False)
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh)):
+                    if i in self.model.concat_skips:
+                        B = self.model.apply_concat(B, inputs_residuals, layer=i)
+                    if i in self.model.branch_inputs_starts:
+                        branch_snapshots[i] = B
+                    if self.mixer_mode == "frozen" and isinstance(layer, LINEARIZABLE_LAYERS):
+                        B = layer.frozen_forward(B, self.model.pre_acts[i], affine=False)
+                    elif isinstance(layer, ACTIVATION_LAYERS):
                         # Get activation ratios
-                        pre_act = self.model.pre_acts[i].to(self.device)
-                        post_act = self.model.acts[i].to(self.device)
-                        vertices = (post_act / pre_act).to(self.device)
+                        pre_act = self.model.pre_acts[i]
+                        post_act = self.model.acts[i]
+                        vertices = post_act / pre_act
                         vertices = torch.where(
-                            torch.isnan(vertices).to(self.device) | torch.isinf(vertices).to(self.device),
-                            torch.tensor(0.0, device=self.device),
+                            torch.isnan(vertices) | torch.isinf(vertices),
+                            _zero,
                             vertices
                         ).squeeze(0)  # Remove original batch dim
                         B = B * vertices
                     elif isinstance(layer, nn.Conv2d):
-                        B = F.conv2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding)
-                    elif isinstance(layer, nn.Conv1d):
-                        B = F.conv1d(B.squeeze(2), layer.weight, None, stride=layer.stride, padding=layer.padding)
-                        B = B.unsqueeze(2)
+                        B = F.conv2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding,
+                                     dilation=layer.dilation, groups=layer.groups)
                     elif isinstance(layer, nn.ConvTranspose2d):
-                        B = F.conv_transpose2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding, output_padding=layer.output_padding)
-                    elif isinstance(layer, nn.ConvTranspose1d):
-                        B = F.conv_transpose1d(B.squeeze(2), layer.weight, None, stride=layer.stride, padding=layer.padding, output_padding=layer.output_padding)
-                        B = B.unsqueeze(2)
-                    elif isinstance(layer, (nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Flatten)):
+                        B = F.conv_transpose2d(B, layer.weight, None, stride=layer.stride, padding=layer.padding,
+                                               output_padding=layer.output_padding, dilation=layer.dilation, groups=layer.groups)
+                    elif isinstance(layer, (nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Flatten, nn.Upsample, nn.PixelShuffle)):
                         B = layer(B)
                     elif isinstance(layer, nn.Linear):
-                        B = B.reshape(current_batch_size, -1)
-                        B = torch.matmul(layer.weight, B.transpose(-1, -2)).transpose(-1, -2)
-                    elif isinstance(layer, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                        B = B * (layer.weight / torch.sqrt(layer.running_var + layer.eps)).view(1, -1, 1, 1)
+                        B = (layer.weight @ B.transpose(-1,-2)).transpose(-1,-2)
+                    elif isinstance(layer, nn.BatchNorm2d):
+                        B = B * (layer.weight/torch.sqrt(layer.running_var+layer.eps)).view(1,-1,1,1)
+                    elif isinstance(layer, nn.LayerNorm):
+                        B = B * layer.weight/torch.sqrt(self.model.layernorms[i][1]+layer.eps)
+                    elif isinstance(layer, RMSNorm):
+                        B = B * layer.weight / self.model.layernorms[i]
+                    elif isinstance(layer, nn.GroupNorm):
+                        var_expanded = self.model.layernorms[i][1]
+                        B = B * (layer.weight.view(1, -1, 1, 1) / torch.sqrt(var_expanded + layer.eps))
                     elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
                         pool = self.model.maxpool_indices[i]
-                        batch_indices = torch.arange(current_batch_size).view(-1, 1, 1, 1).to(self.device)
-                        channel_indices = torch.arange(pool.shape[1]).view(1, -1, 1, 1).to(self.device)
-                        row_indices = (pool // B.shape[3]).to(self.device)  # Fixed bug in original code (was B.shape[2])
-                        col_indices = (pool % B.shape[3]).to(self.device)
-                        B = B[batch_indices, channel_indices, row_indices, col_indices]
-                    elif isinstance(layer, nn.MaxPool1d):
-                        pool = self.model.maxpool_indices[i]
-                        batch_indices = torch.arange(current_batch_size).view(-1, 1, 1, 1).to(self.device)
-                        channel_indices = torch.arange(pool.shape[1]).view(1, -1, 1, 1).to(self.device)
-                        row_indices = torch.zeros_like(pool).to(self.device)
-                        col_indices = pool.to(self.device)
+                        batch_indices = torch.arange(current_batch_size, device=self.device).view(-1,1,1,1)
+                        channel_indices = torch.arange(pool.shape[1], device=self.device).view(1,-1,1,1)
+                        row_indices = pool // B.shape[2] if IN_2D else pool
+                        col_indices = pool % B.shape[3]
                         B = B[batch_indices, channel_indices, row_indices, col_indices]
 
-                # Cat the vector produced to the matrix M(W,f)(x)
-                A = torch.cat((A, B.transpose(-1, -2)), dim=-1) if A.numel() else B.transpose(-1, -2)
+                B = B.reshape(-1, output_size)
+                A[:, start:end] = B.T
+
+            if extract_weff:
+                return A
 
             # Process bias and batch norm terms by iterating through layers again
             # Computing activation ratios and applying appropriate transformations
-            if self.model._has_bias() or self.model._has_batchnorm() or len(self.model.residuals) > 0:
-                a = torch.zeros(x.shape).to(self.device)
+            if self.model._has_bias() or self.model._has_batchnorm() or self.model._has_layernorm() or self.model._has_groupnorm() or len(self.model.residuals) > 0:
+                a = torch.zeros(x.shape, device=self.device, dtype=dtype)
+                if len(x.shape) == 3:
+                    a = a.unsqueeze(0)
                 inputs_residuals = [None] * self.model.get_num_layers()
-                for i, layer in enumerate(self.layers):
-                    if i in self.model.residuals_starts:
-                        inputs_residuals[i] = a.detach().clone()
+                branch_snapshots = [None] * self.model.get_num_layers()
+                for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+                    if i in self.model.residuals_starts or i in self.model.concat_skips_starts:
+                        inputs_residuals[i] = a
+                    if i in self.model.branch_inputs:
+                        a = branch_snapshots[self.model.branch_inputs[i]]
                     if i in self.model.residuals:
                         a = self.model.apply_residual(a, inputs_residuals, layer=i)
-                    if isinstance(layer, (nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh)):
-                        pre_act = self.model.pre_acts[i].to(self.device)
-                        post_act = self.model.acts[i].to(self.device)
+                    if i in self.model.concat_skips:
+                        a = self.model.apply_concat(a, inputs_residuals, layer=i)
+                    if i in self.model.branch_inputs_starts:
+                        branch_snapshots[i] = a
+                    if self.mixer_mode == "frozen" and isinstance(layer, LINEARIZABLE_LAYERS):
+                        a = layer.frozen_forward(a, self.model.pre_acts[i], affine=True)
+                    elif isinstance(layer, ACTIVATION_LAYERS):
+                        pre_act = self.model.pre_acts[i]
+                        post_act = self.model.acts[i]
                         vertices = post_act / pre_act
                         vertices = torch.where(
                             torch.isnan(vertices) | torch.isinf(vertices),
-                            torch.tensor(0.0, device=self.device),
+                            _zero,
                             vertices
                         )
                         a = a * vertices
-                    elif isinstance(layer, (
-                    nn.Conv2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.Flatten, nn.Linear)):
+                    elif isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.Flatten, nn.Linear, nn.Upsample, nn.PixelShuffle)):
                         a = layer(a)
-                    elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveAvgPool2d)):
+                    elif isinstance(layer, nn.LayerNorm):
+                        a = ((a - self.model.layernorms[i][0])/torch.sqrt(self.model.layernorms[i][1]+layer.eps))*layer.weight + layer.bias
+                    elif isinstance(layer, RMSNorm):
+                        a = a * layer.weight / self.model.layernorms[i]
+                    elif isinstance(layer, nn.GroupNorm):
+                        mean_expanded = self.model.layernorms[i][0]
+                        var_expanded = self.model.layernorms[i][1]
+                        a = ((a - mean_expanded) / torch.sqrt(var_expanded + layer.eps)) * layer.weight.view(1, -1, 1, 1) + layer.bias.view(1, -1, 1, 1)
+                    elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
                         pool = self.model.maxpool_indices[i]
-                        batch_indices = torch.arange(pool.shape[0]).view(-1, 1, 1, 1).to(self.device)
-                        channel_indices = torch.arange(pool.shape[1]).view(1, -1, 1, 1).to(self.device)
-                        row_indices = pool // a.shape[3]
+                        batch_indices = torch.arange(pool.shape[0], device=self.device).view(-1,1,1,1)
+                        channel_indices = torch.arange(pool.shape[1], device=self.device).view(1,-1,1,1)
+                        row_indices = pool // a.shape[2] if IN_2D else pool
                         col_indices = pool % a.shape[3]
-                        a = a[batch_indices, channel_indices, row_indices.to(self.device), col_indices.to(self.device)]
+                        a = a[batch_indices, channel_indices, row_indices, col_indices]
 
-                return torch.cat((A, a.transpose(-1, -2)), dim=-1)
-
+                a = a.reshape(-1, output_size)
+                return torch.cat((A, a.T), dim=-1)
+            
             return A
