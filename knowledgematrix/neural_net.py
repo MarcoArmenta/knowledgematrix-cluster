@@ -494,8 +494,51 @@ class NN(nn.Module):
             )
         )
 
+    def ropeattention(
+            self,
+            d_model: int,
+            num_heads: int,
+            num_kv_heads: Union[int, None]=None,
+            head_dim: Union[int, None]=None,
+            rope_theta: float=10000.0,
+            partial_rotary_factor: float=1.0,
+            qk_norm: bool=False,
+            softcap: Union[float, None]=None,
+            query_scale: Union[float, None]=None,
+            sliding_window: Union[int, None]=None,
+            rms_norm_eps: float=1e-6,
+            bias: bool=False,
+            o_bias: bool=False,
+            causal: bool=True,
+            rope_float32: bool=False
+        ) -> None:
+        self.layers.append(
+            RopeAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                rope_theta=rope_theta,
+                partial_rotary_factor=partial_rotary_factor,
+                qk_norm=qk_norm,
+                softcap=softcap,
+                query_scale=query_scale,
+                sliding_window=sliding_window,
+                rms_norm_eps=rms_norm_eps,
+                bias=bias,
+                o_bias=o_bias,
+                causal=causal,
+                rope_float32=rope_float32
+            )
+        )
+
     def swiglu(self, d_model: int, d_ff: int, bias: bool=False) -> None:
         self.layers.append(SwiGLU(d_model=d_model, d_ff=d_ff, bias=bias))
+
+    def geglu(self, d_model: int, d_ff: int, bias: bool=False,
+              approximate: str="tanh") -> None:
+        self.layers.append(GeGLU(d_model=d_model, d_ff=d_ff, bias=bias,
+                                 approximate=approximate))
 
 
     ### Positional Encoding ###
@@ -1294,6 +1337,232 @@ class SwiGLU(nn.Module):
         return F.linear(gate0 * F.linear(x, self.up_proj.weight, up_bias), self.down_proj.weight, down_bias)
 
 
+class GeGLU(SwiGLU):
+    """
+        SwiGLU with a GELU gate: out = down( gelu(gate(x)) * up(x) ).
+        The MLP of the Gemma family; identical in structure to SwiGLU, so
+        the same frozen linearization applies with silu replaced by gelu.
+
+        Args:
+            d_model (int): The dimension of the model.
+            d_ff (int): The dimension of the hidden (intermediate) layer.
+            bias (bool): Whether the three projections have a bias.
+            approximate (str): "tanh" (Gemma's gelu_pytorch_tanh) or "none".
+    """
+    def __init__(self, d_model: int, d_ff: int, bias: bool = False,
+                 approximate: str = "tanh") -> None:
+        super().__init__(d_model, d_ff, bias=bias)
+        self.approximate = approximate
+
+    def _act(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x, approximate=self.approximate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self._act(self.gate_proj(x)) * self.up_proj(x))
+
+    def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:
+        gate0 = self._act(self.gate_proj(x0))
+        up_bias = self.up_proj.bias if (affine and self.up_proj.bias is not None) else None
+        down_bias = self.down_proj.bias if (affine and self.down_proj.bias is not None) else None
+        return F.linear(gate0 * F.linear(x, self.up_proj.weight, up_bias), self.down_proj.weight, down_bias)
+
+
+class RopeAttention(nn.Module):
+    """
+        Grouped-query attention with rotary position embeddings: the
+        attention block of the Llama / Mistral / Gemma / Qwen2.5 families.
+
+        Deliberately the plain version -- no output gate (that is
+        Qwen3.5's GatedAttention) -- with the per-family options that
+        actually differ expressed as flags:
+
+        - ``qk_norm``: RMS-normalize queries and keys per head (Qwen3,
+          Gemma-3; absent in Llama and Mistral),
+        - ``softcap``: tanh soft-capping of the attention logits
+          (Gemma-2's attn_logit_softcapping; None disables it),
+        - ``query_scale``: the divisor applied to the scores; defaults to
+          sqrt(head_dim), which is what Llama and Mistral use, and Gemma
+          overrides with query_pre_attn_scalar,
+        - ``sliding_window``: restrict each position to the last W keys
+          (Gemma's alternating local layers; None = full causal).
+
+        Like the other mixers, the block maps d_model -> d_model, and
+        ``frozen_forward`` freezes the attention weights at the actual
+        layer input so the map stays LINEAR across positions through the
+        value path.
+
+        Args:
+            d_model (int): The dimension of the model.
+            num_heads (int): Number of query heads.
+            num_kv_heads (int): Number of key/value heads (GQA).
+            head_dim (int): Per-head dimension; defaults to d_model // num_heads.
+            rope_theta (float): RoPE base frequency.
+            partial_rotary_factor (float): Fraction of head_dim rotated.
+            qk_norm (bool): RMS-normalize q and k per head.
+            softcap (float | None): tanh soft-cap for attention logits.
+            query_scale (float | None): score divisor; default sqrt(head_dim).
+            sliding_window (int | None): local attention width.
+            rms_norm_eps (float): epsilon of the optional q/k norms.
+            bias (bool): Whether the projections have biases.
+            causal (bool): Apply the causal mask.
+    """
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            num_kv_heads: Union[int, None] = None,
+            head_dim: Union[int, None] = None,
+            rope_theta: float = 10000.0,
+            partial_rotary_factor: float = 1.0,
+            qk_norm: bool = False,
+            softcap: Union[float, None] = None,
+            query_scale: Union[float, None] = None,
+            sliding_window: Union[int, None] = None,
+            rms_norm_eps: float = 1e-6,
+            bias: bool = False,
+            o_bias: bool = False,
+            causal: bool = True,
+            rope_float32: bool = False
+        ) -> None:
+        super().__init__()
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        if num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive.")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads.")
+        if head_dim is None:
+            if d_model % num_heads != 0:
+                raise ValueError("d_model must be divisible by num_heads when head_dim is not given.")
+            head_dim = d_model // num_heads
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.d_head = head_dim
+        self.kv_repeat = num_heads // num_kv_heads
+        self.rope_theta = rope_theta
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
+        if self.rotary_dim % 2 != 0:
+            raise ValueError("head_dim * partial_rotary_factor must be even.")
+        self.softcap = softcap
+        self.query_scale = float(query_scale) if query_scale else math.sqrt(head_dim)
+        self.sliding_window = sliding_window
+        self.causal = causal
+        self.use_qk_norm = qk_norm
+        # HF builds the RoPE tables from a float32 inv_freq buffer, and its
+        # RMSNorm hardcodes an internal .to(float32), so in float64 the
+        # reference is deliberately LESS accurate than exact arithmetic.
+        # Default False = exact tables: in float32 (the production dtype)
+        # the two agree to machine precision anyway (~2e-7 relative,
+        # measured), and in float64 ours is the correct one. Set True only
+        # to reproduce HF's float32 rounding on purpose.
+        self.rope_float32 = rope_float32
+
+        self.q_proj = nn.Linear(d_model, num_heads * head_dim, bias=bias)
+        self.k_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=bias)
+        self.v_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=bias)
+        # Qwen2.5 puts biases on q/k/v but not on o_proj, so the two are
+        # separate flags rather than one.
+        self.o_proj = nn.Linear(num_heads * head_dim, d_model, bias=o_bias)
+        if qk_norm:
+            self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+
+    def _rope(self, T: int, device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        # cos/sin of shape (T, rotary_dim), built in float32 like the
+        # reference implementations (float64 when the net runs in float64).
+        rdt = torch.float64 if dtype == torch.float64 else torch.float32
+        # HF stores inv_freq as a FLOAT32 buffer regardless of model dtype,
+        # so in float64 cos(1) comes back as 0.5403023362, not 0.5403023059.
+        # rope_float32=True reproduces that rounding on purpose; the default
+        # is the exact table (see __init__ for why).
+        idt = torch.float32 if self.rope_float32 else rdt
+        inv_freq = 1.0 / (
+            self.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=idt, device=device) / self.rotary_dim)
+        )
+        inv_freq = inv_freq.to(rdt)
+        pos = torch.arange(T, dtype=rdt, device=device)
+        freqs = torch.outer(pos, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x_rot, x_pass = x[..., :self.rotary_dim], x[..., self.rotary_dim:]
+        x_rot = (x_rot * cos) + (self._rotate_half(x_rot) * sin)
+        return torch.cat((x_rot, x_pass), dim=-1)
+
+    def _mask(self, T: int, device) -> Union[torch.Tensor, None]:
+        if not self.causal and self.sliding_window is None:
+            return None
+        m = torch.zeros(T, T, dtype=torch.bool, device=device)
+        if self.causal:
+            m |= torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
+        if self.sliding_window is not None:
+            m |= torch.tril(
+                torch.ones(T, T, dtype=torch.bool, device=device),
+                diagonal=-int(self.sliding_window)
+            )
+        return m
+
+    def _scores(self, x0: torch.Tensor) -> torch.Tensor:
+        """Attention weights from the layer input (shared by forward and
+        the frozen linearization, so the two cannot drift apart)."""
+        batch, B, T, D = x0.shape
+        q = self.q_proj(x0).view(batch, B, T, self.num_heads, self.d_head)
+        k = self.k_proj(x0).view(batch, B, T, self.num_kv_heads, self.d_head)
+        if self.use_qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+        q, k = q.transpose(2, 3), k.transpose(2, 3)
+        cos, sin = self._rope(T, x0.device, x0.dtype)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
+        if self.kv_repeat > 1:
+            k = k.repeat_interleave(self.kv_repeat, dim=-3)
+        scores = q @ k.transpose(-2, -1) / self.query_scale
+        if self.softcap is not None:
+            scores = self.softcap * torch.tanh(scores / self.softcap)
+        mask = self._mask(T, x0.device)
+        if mask is not None:
+            scores = scores.masked_fill(mask, float("-inf"))
+        return torch.softmax(scores, dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, B, T, D = x.shape
+        attn = self._scores(x)
+        v = self.v_proj(x).view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
+        if self.kv_repeat > 1:
+            v = v.repeat_interleave(self.kv_repeat, dim=-3)
+        out = attn @ v
+        out = out.transpose(2, 3).contiguous().view(batch, B, T, self.num_heads * self.d_head)
+        return self.o_proj(out)
+
+    def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:
+        """
+            Frozen-routing linearization: the attention weights are computed
+            from (and frozen at) the actual layer input x0, so
+            x -> frozen_forward(x, x0) is LINEAR across positions through
+            the value path and equals forward(x0) at x = x0 exactly.
+        """
+        batch, B, T, D = x.shape
+        attn0 = self._scores(x0)
+        v_bias = self.v_proj.bias if (affine and self.v_proj.bias is not None) else None
+        v = F.linear(x, self.v_proj.weight, v_bias)
+        v = v.view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
+        if self.kv_repeat > 1:
+            v = v.repeat_interleave(self.kv_repeat, dim=-3)
+        out = attn0 @ v
+        out = out.transpose(2, 3).reshape(batch, B, T, self.num_heads * self.d_head)
+        o_bias = self.o_proj.bias if (affine and self.o_proj.bias is not None) else None
+        return F.linear(out, self.o_proj.weight, o_bias)
+
+
 class GatedAttention(nn.Module):
     """
         Full attention block of Qwen3-Next / Qwen3.5 ("gated attention"):
@@ -1872,7 +2141,7 @@ ACTIVATION_LAYERS = (
     nn.ELU, nn.LeakyReLU, nn.ReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU,
     nn.Mish, nn.Softmax, nn.CELU, nn.Hardsigmoid, nn.Hardswish, nn.PReLU,
     nn.ReLU6, nn.Softplus, MultiHeadAttention, GatedAttention, GatedDeltaNet,
-    SwiGLU,
+    SwiGLU, GeGLU, RopeAttention,
 )
 
 # Layers that additionally support the frozen-routing linearization
@@ -1884,4 +2153,5 @@ ACTIVATION_LAYERS = (
 # knowledge matrix row-sum invariant is preserved -- but attribution can
 # flow ACROSS token positions through the value paths, which the ratio
 # treatment (a diagonal map) cannot express.
-LINEARIZABLE_LAYERS = (MultiHeadAttention, GatedAttention, GatedDeltaNet, SwiGLU)
+LINEARIZABLE_LAYERS = (MultiHeadAttention, GatedAttention, GatedDeltaNet,
+                       SwiGLU, GeGLU, RopeAttention)
