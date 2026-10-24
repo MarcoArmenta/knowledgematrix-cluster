@@ -52,6 +52,14 @@ class NN(nn.Module):
         # handled by concat_skip.
         self.branch_inputs: Dict[int, int] = {}
         self.branch_inputs_starts: set[int] = set()
+        # Model split over several devices (see `shard`): layer_devices[i]
+        # is the device layer i lives on, or None when the whole network is
+        # on `self.device`. The forward passes move the activation to the
+        # layer's device before applying it, so a network too large for one
+        # GPU runs as a pipeline over two or more (one input at a time; no
+        # pipelining of several inputs is attempted).
+        self.layer_devices: Optional[List[str]] = None
+        self.shard_boundaries: Optional[List[int]] = None
 
 
     ### Linear Layers ###
@@ -610,7 +618,7 @@ class NN(nn.Module):
             self.concat_skips[end] = [start]
 
     def apply_concat(self, x: torch.Tensor, outputs: list[torch.Tensor], layer: int) -> torch.Tensor:
-        sources = [outputs[s] for s in self.concat_skips[layer]]
+        sources = [outputs[s].to(x.device) for s in self.concat_skips[layer]]
         return torch.cat(sources + [x], dim=1)
 
     def branch_input(self, start: int, end: int) -> None:
@@ -941,8 +949,8 @@ class NN(nn.Module):
 
     def forward(self, x: torch.Tensor, return_penultimate:bool=False) -> torch.Tensor:
         start_layer = self._get_start_layer()  # Start layer is the one after the embedding and positional encoding
-        for layer in self.layers[:start_layer]:
-            x = layer(x)
+        for i, layer in enumerate(self.layers[:start_layer]):
+            x = layer(self.to_layer_device(x, i))
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
         # Update the input shape, useful when the input shape is not known beforehand (e.g. for transformers)
@@ -954,10 +962,11 @@ class NN(nn.Module):
         if not self.save:  # Regular forward pass
             layers = self.layers[:-1] if return_penultimate else self.layers
             for i, layer in enumerate(layers[start_layer:], start=start_layer):
+                x = self.to_layer_device(x, i)
                 if i in self.residuals_starts or i in self.concat_skips_starts:
                     inputs_residuals[i] = x
                 if i in self.branch_inputs:
-                    x = branch_snapshots[self.branch_inputs[i]]
+                    x = self.to_layer_device(branch_snapshots[self.branch_inputs[i]], i)
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.concat_skips:
@@ -978,10 +987,11 @@ class NN(nn.Module):
             self.layernorms: list[torch.Tensor] = [None] * self.get_num_layers()
 
             for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+                x = self.to_layer_device(x, i)
                 if i in self.residuals_starts or i in self.concat_skips_starts:
                     inputs_residuals[i] = x
                 if i in self.branch_inputs:
-                    x = branch_snapshots[self.branch_inputs[i]]
+                    x = self.to_layer_device(branch_snapshots[self.branch_inputs[i]], i)
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
                 if i in self.concat_skips:
@@ -1018,15 +1028,18 @@ class NN(nn.Module):
         return x
 
     def apply_residual(self, x: torch.Tensor, outputs: list[torch.Tensor], layer: int, affine: bool=True) -> torch.Tensor:
+        # A snapshot taken on another device (model split, see `shard`)
+        # is moved to the device of the layer that consumes it; the
+        # projection modules were moved there by `shard`.
         if affine:
             for start_idx, proj in self.residuals[layer]:
-                output = outputs[start_idx]
+                output = outputs[start_idx].to(x.device)
                 for layer in proj:
                     output = layer(output)
                 x = x + output
         else:
             for start_idx, proj in self.residuals[layer]:
-                output = outputs[start_idx]
+                output = outputs[start_idx].to(x.device)
                 for layer in proj:
                     if isinstance(layer, nn.BatchNorm2d):
                         output = output * (layer.weight/torch.sqrt(layer.running_var+layer.eps)).view(1,-1,1,1)
@@ -1105,6 +1118,141 @@ class NN(nn.Module):
     
     def get_num_layers(self) -> int:
         return len(self.layers)
+
+    ### Model split over several devices ###
+
+    def layer_device(self, i: int) -> str:
+        """
+            The device layer i lives on: `self.device` for an unsplit
+            network, `layer_devices[i]` after `shard`.
+        """
+        if self.layer_devices is None:
+            return self.device
+        return self.layer_devices[i]
+
+    def to_layer_device(self, x: torch.Tensor, i: int) -> torch.Tensor:
+        """
+            `x` moved to the device of layer i (a no-op, returning `x`
+            itself, for an unsplit network or when it is already there).
+            The transfer is differentiable, so the linearized graphs of
+            KnowledgeRowComputer cross the device boundary unchanged.
+        """
+        if self.layer_devices is None:
+            return x
+        dev = self.layer_devices[i]
+        if str(x.device) == dev:
+            return x
+        return x.to(dev)
+
+    def shard_cut_points(self) -> List[int]:
+        """
+            Layer indices at which the network may be cut between two
+            devices without a residual connection crossing the cut
+            (`start < cut <= end` for a residual start -> end). A cut at
+            index c puts layers [.., c) on one device and [c, ..) on the
+            next. For the transformer models every block boundary is such
+            a point. Cuts inside a concatenation-skip or branch-input span
+            are excluded too, so the Inception / DenseNet topologies cut
+            only between their modules.
+        """
+        n = self.get_num_layers()
+        spans = [(s, e) for e, pairs in self.residuals.items() for s, _ in pairs]
+        spans += [(s, e) for e, srcs in self.concat_skips.items() for s in srcs]
+        spans += [(s, e) for e, s in self.branch_inputs.items()]
+        first = self._get_start_layer() + 1
+        return [c for c in range(first, n)
+                if not any(s < c <= e for s, e in spans)]
+
+    def shard(
+            self,
+            devices: List[str],
+            boundaries: Optional[List[int]] = None
+        ) -> "NN":
+        """
+            Split the network over `devices` as a pipeline: layers
+            [0, b1) go to devices[0], [b1, b2) to devices[1], ..., and the
+            forward passes (and KnowledgeRowComputer) move the activation
+            across at each boundary. This is a model split for networks
+            that do not fit one GPU (e.g. a 24B-parameter LLM in bf16 with
+            a long context); the inputs are still processed one at a time.
+
+            Args:
+                devices (List[str]): one device per stage, in pipeline
+                    order ("cuda:0", "cuda:1", ...). A single device just
+                    moves the network there.
+                boundaries (List[int] | None): the len(devices) - 1 cut
+                    indices (each from `shard_cut_points`). By default the
+                    cuts balance the parameter count across the stages,
+                    choosing among the admissible cut points.
+            Returns:
+                NN: self.
+        """
+        devices = [str(d) for d in devices]
+        if len(devices) == 0:
+            raise ValueError("shard needs at least one device.")
+        n = self.get_num_layers()
+        k = len(devices)
+        if k == 1:
+            return self.unshard(devices[0])
+        allowed = self.shard_cut_points()
+        if boundaries is None:
+            counts = [sum(p.numel() for p in layer.parameters()) for layer in self.layers]
+            total = float(sum(counts)) or 1.0
+            cum = [0.0]
+            for c in counts:
+                cum.append(cum[-1] + c)
+            boundaries = []
+            lo = 0
+            for stage in range(1, k):
+                target = total * stage / k
+                candidates = [c for c in allowed if c > lo and c < n - (k - 1 - stage)]
+                if not candidates:
+                    raise ValueError(
+                        f"cannot cut the network into {k} stages: no admissible "
+                        f"cut point after layer {lo} (see shard_cut_points)."
+                    )
+                best = min(candidates, key=lambda c: abs(cum[c] - target))
+                boundaries.append(best)
+                lo = best
+        boundaries = [int(b) for b in boundaries]
+        if len(boundaries) != k - 1:
+            raise ValueError(f"{k} devices need {k - 1} boundaries, got {len(boundaries)}.")
+        if sorted(boundaries) != boundaries or len(set(boundaries)) != len(boundaries):
+            raise ValueError(f"boundaries must be strictly increasing, got {boundaries}.")
+        for b in boundaries:
+            if b not in allowed:
+                raise ValueError(
+                    f"layer {b} is not an admissible cut point (a residual or "
+                    f"skip connection crosses it); admissible: {allowed}."
+                )
+        edges = [0] + boundaries + [n]
+        layer_devices = []
+        for stage in range(k):
+            layer_devices += [devices[stage]] * (edges[stage + 1] - edges[stage])
+        with torch.no_grad():
+            for i, layer in enumerate(self.layers):
+                layer.to(layer_devices[i])
+            # projection modules live with the layer that applies them
+            for end, pairs in self.residuals.items():
+                for _, proj in pairs:
+                    for module in proj:
+                        module.to(layer_devices[end])
+        self.layer_devices = layer_devices
+        self.shard_boundaries = boundaries
+        self.device = devices[0]
+        return self
+
+    def unshard(self, device: Union[str, None] = None) -> "NN":
+        """
+            Undo `shard`: the whole network on one device (`self.device`
+            by default) and the forward passes without device moves.
+        """
+        device = str(device) if device is not None else str(self.device)
+        self.layer_devices = None
+        self.shard_boundaries = None
+        self.to(device)
+        self.device = device
+        return self
 
     def eval(self) -> None:
         for layer in self.layers:

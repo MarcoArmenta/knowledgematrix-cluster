@@ -88,12 +88,16 @@ class KnowledgeRowComputer:
             model.save = True
             out0 = model.forward(x)
             model.save = False
-            model.to(self.device)
+            if model.layer_devices is None:
+                model.to(self.device)
+            # (a sharded model stays where `NN.shard` put it: the saved
+            # states sit on their layer's device and `_linear_forward`
+            # follows the same device map)
 
             start_layer = model._get_start_layer()
             e0 = x
-            for layer in model.layers[:start_layer]:
-                e0 = layer(e0)
+            for i, layer in enumerate(model.layers[:start_layer]):
+                e0 = layer(model.to_layer_device(e0, i))
             if e0.dim() == 3:
                 e0 = e0.unsqueeze(0)
             e0 = e0.to(self.device)
@@ -124,16 +128,17 @@ class KnowledgeRowComputer:
         """
         model = self.model
         start_layer = model._get_start_layer()
-        _zero = torch.tensor(0.0, device=self.device, dtype=e.dtype)
         inputs_residuals = [None] * model.get_num_layers()
         branch_snapshots = [None] * model.get_num_layers()
 
         B = e
         for i, layer in enumerate(model.layers[start_layer:], start=start_layer):
+            B = model.to_layer_device(B, i)   # no-op unless the model is sharded
+            _zero = torch.tensor(0.0, device=B.device, dtype=e.dtype)
             if i in model.residuals_starts or i in model.concat_skips_starts:
                 inputs_residuals[i] = B
             if i in model.branch_inputs:
-                B = branch_snapshots[model.branch_inputs[i]]
+                B = model.to_layer_device(branch_snapshots[model.branch_inputs[i]], i)
             if i in model.residuals:
                 B = model.apply_residual(B, inputs_residuals, layer=i, affine=False)
             if i in model.concat_skips:
