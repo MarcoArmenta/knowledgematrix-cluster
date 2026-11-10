@@ -407,6 +407,9 @@ class WeightLoader:
                 pipeline over several -- then the network comes out
                 sharded exactly as NN.shard(devices, boundaries) would
                 leave it, without ever being assembled on one device.
+                "meta" is a dry run: every tensor is located and its shape
+                checked against the network, nothing is stored -- enough
+                to prove that a checkpoint fits before paying for it.
             boundaries (List[int] | None): cut indices of the pipeline
                 (see NN.shard); default balances the parameter count.
             copy (bool): for an in-memory model, copy the tensors (True,
@@ -444,6 +447,7 @@ class WeightLoader:
         else:
             self.layer_devices, self.boundaries = net.shard_layout(devices, boundaries)
         self.devices = devices
+        self._assigned: set = set()
 
     def _device(self, layer: int) -> str:
         return self.devices[0] if self.layer_devices is None else self.layer_devices[layer]
@@ -516,14 +520,20 @@ class WeightLoader:
         if self.copy and _borrowed and out.data_ptr() == source.data_ptr():
             out = out.clone()
         module._parameters[name] = nn.Parameter(out, requires_grad=target.requires_grad)
+        self._assigned.add((id(module), name))
 
     def finish(self) -> NN:
         """
             Check that every parameter received a tensor, record where the
             network lives, and return it.
         """
-        missing = [name for name, p in self.net.named_parameters() if p.is_meta]
-        missing += [name for name, b in self.net.named_buffers() if b.is_meta]
+        missing = []
+        for prefix, module in self.net.named_modules():
+            for name, param in module._parameters.items():
+                if param is not None and (id(module), name) not in self._assigned:
+                    missing.append(f"{prefix}.{name}" if prefix else name)
+        if self.devices != ["meta"]:
+            missing += [name for name, b in self.net.named_buffers() if b.is_meta]
         if missing:
             shown = ", ".join(missing[:8]) + (", ..." if len(missing) > 8 else "")
             raise RuntimeError(
