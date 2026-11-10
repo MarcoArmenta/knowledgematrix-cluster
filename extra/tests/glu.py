@@ -269,5 +269,120 @@ class TestLlamaFFN(unittest.TestCase):
         self.assertLess(rel, 1e-9, f"LLaMA-FFN KM invariant broken: rel={rel}")
 
 
+# --------------------------------------------------------------------------- #
+# Coexistence with the SwiGLU feed-forward block (NN.swiglu), which the LLM
+# models use and whose API must not change.
+# --------------------------------------------------------------------------- #
+import inspect
+from knowledgematrix.neural_net import SwiGLU, ACTIVATION_LAYERS, LINEARIZABLE_LAYERS
+from knowledgematrix.row_computer import KnowledgeRowComputer
+
+
+def _ffn_pair(n, d, d_ff, k, bias, alpha, seed):
+    """
+        The same function built twice: with the SwiGLU block (gate, up and
+        down projections in one layer) and with GLU + a separate down
+        Linear, sharing all weights.
+    """
+    torch.manual_seed(seed)
+    base = NN(input_shape=(n,1,1)); base.flatten()
+    base.linear(n, d); base.swiglu(d, d_ff, bias=bias); base.linear(d, k); base.eval()
+    new = NN(input_shape=(n,1,1)); new.flatten()
+    new.linear(n, d); new.glu(d, d_ff, activation="silu", bias=bias, alpha=alpha)
+    new.linear(d_ff, d, bias=bias); new.linear(d, k); new.eval()
+    blk, g = base.layers[2], new.layers[2]
+    with torch.no_grad():
+        new.layers[1].load_state_dict(base.layers[1].state_dict())
+        g.gate_proj.load_state_dict(blk.gate_proj.state_dict())
+        g.value_proj.load_state_dict(blk.up_proj.state_dict())
+        new.layers[3].load_state_dict(blk.down_proj.state_dict())
+        new.layers[4].load_state_dict(base.layers[3].state_dict())
+    return base, new
+
+
+def _km(m, x, **kw):
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        return KnowledgeMatrixComputer(m, **kw).forward(x)
+
+
+class TestGLUAndSwiGLUCoexist(unittest.TestCase):
+    def test_swiglu_api_unchanged(self):
+        # NN.swiglu / SwiGLU keep the signature and the frozen linearization
+        # the LLM models rely on; GLU is a different, additional layer.
+        empty = inspect.Parameter.empty
+        self.assertEqual(
+            [(p.name, p.default) for p in inspect.signature(NN.swiglu).parameters.values()],
+            [("self", empty), ("d_model", empty), ("d_ff", empty), ("bias", False)])
+        blk = SwiGLU(6, 12)
+        self.assertTrue(hasattr(blk, "down_proj") and hasattr(blk, "frozen_forward"))
+        self.assertIsNone(blk.gate_proj.bias)
+        self.assertFalse(issubclass(GLU, SwiGLU) or issubclass(SwiGLU, GLU))
+        self.assertIn(SwiGLU, ACTIVATION_LAYERS); self.assertIn(SwiGLU, LINEARIZABLE_LAYERS)
+        self.assertNotIn(GLU, ACTIVATION_LAYERS); self.assertNotIn(GLU, LINEARIZABLE_LAYERS)
+
+    def test_alpha_zero_is_the_frozen_gate_map_of_swiglu(self):
+        # alpha=0 credits the value path only, with the gate frozen at its
+        # actual value: entry for entry the knowledge matrix of the SwiGLU
+        # block under mixer_mode="frozen" (bias column included).
+        for bias in (False, True):
+            base, new = _ffn_pair(n=7, d=6, d_ff=10, k=4, bias=bias, alpha=0.0, seed=21)
+            x = torch.randn(7, 1, 1)
+            self.assertLess(torch.norm(base.forward(x) - new.forward(x)).item(), 1e-12)
+            A_frozen = _km(base, x, mixer_mode="frozen")
+            A_alpha0 = _km(new, x)
+            self.assertEqual(A_frozen.shape, A_alpha0.shape)
+            self.assertLess(torch.norm(A_frozen - A_alpha0).item(), 1e-10, f"bias={bias}")
+
+    def test_alpha_positive_is_a_different_linearization(self):
+        # For alpha > 0 part of the credit goes through the gate path, which
+        # neither treatment of the SwiGLU block (the elementwise post/pre
+        # ratio, the frozen gate) produces. All of them still row-sum to the
+        # forward pass.
+        for alpha in (0.5, 1.0):
+            base, new = _ffn_pair(n=7, d=6, d_ff=10, k=4, bias=True, alpha=alpha, seed=22)
+            x = torch.randn(7, 1, 1)
+            out = new.forward(x).reshape(-1)
+            A = _km(new, x)
+            A_ratio = _km(base, x, mixer_mode="ratio")
+            A_frozen = _km(base, x, mixer_mode="frozen")
+            for M in (A, A_ratio, A_frozen):
+                self.assertLess((torch.norm(M.sum(1) - out) / torch.norm(out)).item(), 1e-9)
+            self.assertGreater(torch.norm(A - A_frozen).item(), 1e-3, f"alpha={alpha}")
+            self.assertGreater(torch.norm(A - A_ratio).item(), 1e-3, f"alpha={alpha}")
+
+    def test_alpha_governs_in_both_mixer_modes(self):
+        # GLU is linearized by its own alpha whatever the mixer_mode.
+        torch.manual_seed(23)
+        m = NN(input_shape=(9,1,1)); m.flatten()
+        m.linear(9, 8); m.relu(); m.glu(8, 12, alpha=0.3); m.linear(12, 5); m.eval()
+        x = torch.randn(9, 1, 1)
+        self.assertLess(torch.norm(_km(m, x, mixer_mode="ratio") - _km(m, x, mixer_mode="frozen")).item(), 1e-12)
+
+
+class TestGLURowComputer(unittest.TestCase):
+    def test_rows_match_matrix_rows(self):
+        # KnowledgeRowComputer (reverse mode) returns the rows of the matrix
+        # KnowledgeMatrixComputer builds, for every gate activation and alpha.
+        for idx, (act, alpha) in enumerate([("silu", 0.0), ("silu", 0.5), ("gelu", 0.3),
+                                            ("sigmoid", 0.7), ("tanh", 1.0), ("relu", 0.5)]):
+            torch.manual_seed(400 + idx)
+            m = NN(input_shape=(10,1,1)); m.flatten()
+            m.linear(10, 12); m.relu()
+            m.glu(12, 16, activation=act, alpha=alpha)
+            m.linear(16, 6); m.eval()
+            x = torch.randn(10, 1, 1)
+            rows = [0, 3, 5]
+            for mode in ("ratio", "frozen"):
+                A = _km(m, x, batch_size=4, mixer_mode=mode)
+                with _w.catch_warnings():
+                    _w.simplefilter("ignore")
+                    R = KnowledgeRowComputer(m, mixer_mode=mode).forward(x, rows)
+                    W = KnowledgeRowComputer(m, mixer_mode=mode).forward(x, rows, extract_weff=True)
+                self.assertEqual(tuple(R.shape), (len(rows), A.shape[1]))
+                self.assertLess(torch.norm(R - A[rows]).item(), 1e-10, f"{act} alpha={alpha} {mode}")
+                self.assertLess(torch.norm(W * x.reshape(1, -1) - A[rows, :-1]).item(), 1e-10)
+
+
 if __name__ == "__main__":
     unittest.main()
