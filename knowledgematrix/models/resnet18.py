@@ -99,12 +99,9 @@ class ResNet18(NN):
                     f"The input shape is {input_shape}. The first layer won't have pretrained weights."
                 )
                 self.layers[0] = nn.Conv2d(input_shape[0], 64, kernel_size=3, stride=1, padding=1, bias=False)
-            elif num_classes != 1000:
-                print(
-                    f"Warning: The pretrained model was trained on 1000 classes. "
-                    f"The number of classes is {num_classes}. The last layer won't have pretrained weights."
-                )
-                self.layers[-1] = nn.Linear(512, num_classes)
+            elif num_classes != pretrained_model.fc.out_features:
+                print(f"Warning: replacing the fc head ({pretrained_model.fc.out_features} -> {num_classes} classes).")
+                self.layers[-1] = nn.Linear(pretrained_model.fc.in_features, num_classes)
             if freeze_features:
                 self.freeze_features()
         else:
@@ -153,10 +150,25 @@ class ResNet18(NN):
         end_skip = self.get_num_layers()
         self.residual(start_skip, end_skip)
         if block.downsample is not None:
-            # Override the auto-generated projection with torchvision's actual
-            # downsample modules so the pretrained weights are used.
-            for i, downsample_layer in enumerate(block.downsample.children()):
-                self.residuals[end_skip][0][1][i] = downsample_layer
+            # Replace the auto-generated projection with torchvision's actual
+            # downsample modules so the pretrained weights are used -- and
+            # REGISTER them. ``NN.residual`` registers only the projection it
+            # creates; modules swapped in by index would stay outside
+            # ``parameters()`` / ``modules()`` / ``to()`` / ``state_dict()``,
+            # and ``GradientMatrixComputer``'s bias column (a parameter-space
+            # JVP over ``named_parameters()``) would silently miss the
+            # downsample BN's effective bias ``beta - gamma*mu/sigma``
+            # (row-sum residual 2.05 relative on IMAGENET1K_V1 weights; exactly
+            # 0 at fresh init where mu = beta = 0, so init-only tests pass).
+            for stale in self.residuals[end_skip][0][1]:
+                if not isinstance(stale, nn.Identity):
+                    del self.residual_modules[
+                        next(k for k, m in enumerate(self.residual_modules) if m is stale)
+                    ]
+            real_proj = list(block.downsample.children())
+            self.residuals[end_skip][0] = (start_skip, real_proj)
+            for downsample_layer in real_proj:
+                self.residual_modules.append(downsample_layer)
         self._freeze_projection_bns(end_skip)
         # Post-residual ReLU (layer index == end_skip; the residual is added
         # to x BEFORE this layer runs).
