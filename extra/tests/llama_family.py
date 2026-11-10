@@ -35,16 +35,20 @@
     6. LOADER MECHANICS -- sharding, copy / share, dtypes, damaged
        checkpoints, hub arguments; half precision (bfloat16) is as
        accurate as the bfloat16 reference.
-    7. REFUSALS -- configs the network does not reproduce raise.
+    7. FAMILY VARIANTS AND REFUSALS -- the config switches of Mistral,
+       Ministral, Qwen2.5 and of the siblings of the nine (biases, sliding
+       windows per block, head_dim != hidden / heads), each against its
+       transformers class; and what the network does not reproduce raises.
     8. REAL WEIGHTS -- when a checkpoint is in the local Hugging Face
        cache (never downloaded here): our float32 network streamed from
-       disk against the transformers model on real text.
+       disk against the transformers model on real text, short and long.
 
-    Everything except 8 is offline and needs no weights. The real-weights
-    tests run for the checkpoints found in the local cache, one model in
-    memory at a time (up to ~5 GB for Llama-3.2-1B); set
-    KM_SKIP_REAL_WEIGHTS=1 to skip them. Set KM_REPORT=1 to print the
-    measured gaps.
+    Everything except 8 is offline and needs no weights (about 20 s). The
+    real-weights tests run for the checkpoints found in the local cache
+    (HuggingFaceTB/SmolLM2-135M, Qwen/Qwen3-0.6B, unsloth/Llama-3.2-1B),
+    one model in memory at a time -- the float32 Llama-3.2-1B alone is
+    5 GB, and they take a few minutes; set KM_SKIP_REAL_WEIGHTS=1 to skip
+    them. Set KM_REPORT=1 to print every measured gap.
 
     Requires transformers and safetensors (pip install knowledgematrix[hf]);
     without them the whole file is skipped.
@@ -91,20 +95,23 @@ torch.set_default_dtype(torch.float64)
 
 #: HF hardcodes float32 internals (the RoPE inv_freq buffer and the cos /
 #: sin tables, and the .to(torch.float32) inside LlamaRMSNorm.forward), so
-#: even in float64 the reference carries float32 rounding. With the O(1)
-#: weights used here that rounding is ~2e-7 on outputs of scale ~0.3;
-#: anything above this tolerance is a real bug, not a precision artefact.
+#: even in float64 the reference carries float32 rounding. With the
+#: unit-gain weights used here that rounding is, measured, at most 4e-7 on
+#: hidden states of scale ~1 and 1.5e-7 on logits of scale ~0.4; anything
+#: above this tolerance is a real bug, not a precision artefact.
 HF_TOL = 1e-6
 
 #: The same comparison with those two float32 computations of the
 #: reference carried out in float64 instead (`in_its_own_dtype`): then
 #: nothing but float64 rounding separates the two implementations
-#: (measured: ~1e-14), which also proves that the HF_TOL gap above is the
-#: reference's float32 and nothing else.
+#: (measured: at most 2e-15), which also proves that the HF_TOL gap above
+#: is the reference's float32 and nothing else.
 EXACT_TOL = 1e-11
 
 #: A negative control "fails by a wide margin" when it is at least this
-#: far from the reference: 1000 x HF_TOL, on outputs of scale ~0.3.
+#: far from the reference: 1000 x HF_TOL, on logits of scale 0.1 to 0.5
+#: (measured: 4e-3 for the weakest control, a wrong norm epsilon, 5e-2 to
+#: 2 for the structural ones).
 WIDE = 1e-3
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "hf_configs")
@@ -257,8 +264,8 @@ def randomize_(hf, seed: int) -> None:
         weights 1 +- 0.3, biases +- 0.3, and a small embedding (standard
         deviation 0.02, as in real checkpoints) so that the epsilon of the
         first normalization matters. The final norm is scaled down so
-        that hidden states and logits are ~0.3: the float32 rounding
-        inside the reference is relative, and HF_TOL is absolute.
+        that hidden states stay around 1 and logits below: the float32
+        rounding inside the reference is relative, and HF_TOL is absolute.
     """
     g = torch.Generator().manual_seed(seed)
 
@@ -290,6 +297,15 @@ def build_reference(raw, seed: int = 0):
     hf = AutoModelForCausalLM.from_config(config).double().eval()
     randomize_(hf, seed)
     return hf
+
+
+def load_reference(source, dtype, **kwargs):
+    """AutoModelForCausalLM.from_pretrained in a given dtype (the keyword
+    is `dtype` in transformers 5 and `torch_dtype` before)."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(source, dtype=dtype, **kwargs).eval()
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(source, torch_dtype=dtype, **kwargs).eval()
 
 
 def token_ids(seq_len: int = SEQ_LEN, vocab: int = TINY_VOCAB, seed: int = 1) -> torch.Tensor:
@@ -412,7 +428,13 @@ def run(net, ids: torch.Tensor) -> torch.Tensor:
 
 
 def gap(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a.reshape(-1).to(torch.float64) - b.reshape(-1).to(torch.float64)).abs().max().item()
+    """Largest absolute difference. Two float32 (or two float64) tensors
+    are subtracted as they are -- the logits of a real model are too
+    large to be copied to float64 for this."""
+    a, b = a.reshape(-1), b.reshape(-1)
+    if a.dtype != b.dtype or a.dtype not in (torch.float32, torch.float64):
+        a, b = a.to(torch.float64), b.to(torch.float64)
+    return (a - b).abs().max().item()
 
 
 def attention_layers(net):
@@ -1222,7 +1244,7 @@ class TestLoaderMechanics(unittest.TestCase):
         def add_head(tensors):
             tensors["lm_head.weight"] = head.clone()
         _rewrite(d, add_head)
-        reference = AutoModelForCausalLM.from_pretrained(d, dtype=torch.float64).eval()
+        reference = load_reference(d, torch.float64)
         self.assertIsNot(reference.lm_head.weight, reference.model.embed_tokens.weight)
         with torch.no_grad():
             expected = reference(ids).logits
@@ -1629,7 +1651,7 @@ class TestFamilyVariants(unittest.TestCase):
         # transformers in both cases: the class in memory, Auto on disk.
         with tempfile.TemporaryDirectory() as d:
             hf.save_pretrained(d)
-            auto = AutoModelForCausalLM.from_pretrained(d, dtype=torch.float64).eval()
+            auto = load_reference(d, torch.float64)
             self.assertEqual(type(auto).__name__, "MinistralForCausalLM")
             with torch.no_grad():
                 reloaded = auto(ids).logits
@@ -1934,11 +1956,15 @@ LONG_TEXT = (
     "shall seem most likely to effect their Safety and Happiness."
 )
 
-#: float32 against float32 on real weights: the two implementations round
-#: differently, and the difference grows with depth and sequence length
-#: (measured values: KM_REPORT=1). A wiring error is orders above -- see
-#: the controls.
-REAL_TOL = 2e-4
+#: float32 against float32 on real weights, relative to the logit scale.
+#: The two implementations round differently; measured on ~520 tokens:
+#: 1.0e-5 (SmolLM2-135M), 6.8e-6 (Qwen3-0.6B), 6.3e-6 (Llama-3.2-1B) --
+#: which is what transformers differs from ITSELF by when its attention
+#: backend is switched from sdpa to eager (6.8e-6 and 6.4e-6 on the first
+#: two). In float64 with the reference in its own dtype the same
+#: comparison gives 1e-14 (test_smollm2_135m_in_float64). The weakest
+#: wiring error tried on real weights (a wrong norm epsilon) is at 7.6e-4.
+REAL_TOL = 1e-4
 
 
 def _cached(repo: str, *filenames: str) -> bool:
@@ -1968,9 +1994,8 @@ class TestRealWeights(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(repo, local_files_only=True)
         return tokenizer(text, return_tensors="pt").input_ids
 
-    def _reference(self, repo, prompts):
-        hf = AutoModelForCausalLM.from_pretrained(repo, local_files_only=True,
-                                                  dtype=torch.float32).eval()
+    def _reference(self, repo, prompts, yardstick):
+        hf = load_reference(repo, torch.float32, local_files_only=True)
         self.assertEqual({p.dtype for p in hf.parameters()}, {torch.float32})
         outputs = {}
         with torch.no_grad():
@@ -1980,22 +2005,33 @@ class TestRealWeights(unittest.TestCase):
                 if ids.shape[1] < 32:      # the head applied here is the model's own forward
                     self.assertTrue(torch.equal(hf(ids).logits, logits))
                 outputs[label] = (hidden.clone(), logits.clone())
+            if yardstick and hasattr(hf, "set_attn_implementation"):
+                # how far transformers is from itself with another
+                # attention backend (same weights, same dtype)
+                hf.set_attn_implementation("eager")
+                ids = prompts["long"]
+                other = hf.lm_head(hf.model(ids).last_hidden_state)
+                logits = outputs["long"][1]
+                note("real weights", f"{repo} long (T={ids.shape[1]}): transformers sdpa vs eager, relative",
+                     gap(other, logits) / logits.abs().max().item(), logits.abs().max().item())
+                del other
         tied = hf.lm_head.weight is hf.model.embed_tokens.weight
         count = sum(p.numel() for p in hf.parameters())
         del hf
         gc.collect()
         return outputs, tied, count
 
-    def _check(self, repo, wrong, with_head=True):
+    def _check(self, repo, wrong, with_head=True, yardstick=True):
         """
-            wrong: {label: mutation of the attention layers} -- negative
-            controls on the real weights, evaluated on the long prompt
-            (each one applied to the correct network, then undone).
+            wrong: {label: (mutation, floor)} -- negative controls on the
+            real weights, evaluated on the long prompt: each mutation is
+            applied to the correct network, has to move the logits by
+            more than `floor` of their scale, and is undone.
         """
         self._require(repo)
         prompts = {"short": self._ids(repo, SHORT_TEXT), "long": self._ids(repo, LONG_TEXT)}
         self.assertGreater(prompts["long"].shape[1], 300)
-        reference, tied, count = self._reference(repo, prompts)
+        reference, tied, count = self._reference(repo, prompts, yardstick)
 
         net = LlamaLike.from_huggingface(repo, include_lm_head=with_head, local_files_only=True)
         self.assertEqual({p.dtype for p in net.parameters()}, {torch.float32})
@@ -2033,28 +2069,60 @@ class TestRealWeights(unittest.TestCase):
         logits = reference["long"][1][0]
         scale = logits.abs().max().item()
         baseline = gap(logits_of(ids)[1], logits) / scale
-        layers = attention_layers(net)
-        for label, mutate in wrong.items():
-            saved = [(layer.rope_theta, layer.rope_scaling, layer.use_qk_norm) for layer in layers]
+        knobs = {RopeAttention: ("rope_theta", "rope_scaling", "use_qk_norm"), RMSNorm: ("eps",)}
+        for label, (mutate, floor) in wrong.items():
+            saved = [(module, attr, getattr(module, attr))
+                     for module in net.modules() for kind, attrs in knobs.items()
+                     if isinstance(module, kind) for attr in attrs]
             mutate(net)
             per_position = (logits_of(ids)[1] - logits).abs().amax(-1) / scale
-            for layer, (theta, scaling, qk) in zip(layers, saved):
-                layer.rope_theta, layer.rope_scaling, layer.use_qk_norm = theta, scaling, qk
+            for module, attr, value in saved:
+                setattr(module, attr, value)
             off = per_position.max().item()
             note("real weights control", f"{repo} {label}: logits, relative", off, scale)
             for level in (1e-3, 1e-2, 1e-1):
                 above = (per_position > level).nonzero()
                 note("real weights control", f"{repo} {label}: first position off by > {level:g}",
                      float(above[0]) if len(above) else float("nan"))
-            self.assertGreater(off, 100 * REAL_TOL, f"{repo}: {label} is not visible")
-            self.assertGreater(off, 100 * baseline)
+            self.assertGreater(off, floor, f"{repo}: {label} is not visible")
+            self.assertGreater(off, REAL_TOL)
+            self.assertGreater(off, 20 * baseline)
         self.assertLess(gap(logits_of(ids)[1], logits) / scale, REAL_TOL)    # undone
         del net
         gc.collect()
 
     def test_smollm2_135m(self):
         """Tied head, 9 query heads on 3 key/value heads, RoPE base 1e5."""
-        self._check("HuggingFaceTB/SmolLM2-135M", {"RoPE base 10000": _set_theta(10000.0)})
+        self._check("HuggingFaceTB/SmolLM2-135M", {
+            "RoPE base 10000": (_set_theta(10000.0), 0.1),
+            "RMSNorm eps 1e-6 instead of 1e-5": (_other_eps, 0.0),
+        })
+
+    def test_smollm2_135m_in_float64(self):
+        """Real weights without the float32 fog: both models in float64,
+        the reference in its own dtype (in_its_own_dtype) -- what is left
+        between the two implementations is float64 rounding."""
+        repo = "HuggingFaceTB/SmolLM2-135M"
+        self._require(repo)
+        ids = self._ids(repo, LONG_TEXT)
+        hf = load_reference(repo, torch.float64, local_files_only=True)
+        with torch.no_grad():
+            as_is = hf(ids).logits.clone()
+            with in_its_own_dtype(hf):
+                exact = hf(ids).logits.clone()
+        del hf
+        gc.collect()
+        net = LlamaLike.from_huggingface(repo, local_files_only=True, dtype=torch.float64)
+        got = run(net, ids)
+        scale = exact.abs().max().item()
+        note("real weights", f"{repo} float64 long (T={ids.shape[1]}): vs reference as it is, relative",
+             gap(got, as_is) / scale, scale)
+        note("real weights", f"{repo} float64 long (T={ids.shape[1]}): vs reference in its own dtype, relative",
+             gap(got, exact) / scale, scale)
+        self.assertLess(gap(got, as_is) / scale, 1e-5)
+        self.assertLess(gap(got, exact) / scale, 1e-10)
+        del net
+        gc.collect()
 
     def test_smollm2_135m_knowledge_matrix(self):
         """The knowledge matrix of the final hidden states of a real
@@ -2086,8 +2154,11 @@ class TestRealWeights(unittest.TestCase):
     def test_qwen3_0_6b(self):
         """Same architecture as Qwen3-8B / 14B (q/k norm, RoPE base 1e6),
         with head_dim 128 on a hidden size of 1024."""
-        self._check("Qwen/Qwen3-0.6B", {"RoPE base 10000": _set_theta(10000.0),
-                                        "no q/k norm": _no_qk_norm})
+        self._check("Qwen/Qwen3-0.6B", {
+            "RoPE base 10000": (_set_theta(10000.0), 0.1),
+            "no q/k norm": (_no_qk_norm, 0.1),
+            "RMSNorm eps 1e-5 instead of 1e-6": (_other_eps, 0.0),
+        })
 
     def test_llama_3_2_1b(self):
         """The real llama3 RoPE (base 500000, factor 32). Loaded without
@@ -2096,11 +2167,12 @@ class TestRealWeights(unittest.TestCase):
         def original_bug(net):
             _no_rescaling(net)
             _set_theta(10000.0)(net)
-        self._check("unsloth/Llama-3.2-1B",
-                    {"no llama3 rescaling": _no_rescaling,
-                     "llama3 factor 8 instead of 32": _other_factor,
-                     "RoPE base 10000, no rescaling (the original bug)": original_bug},
-                    with_head=False)
+        self._check("unsloth/Llama-3.2-1B", {
+            "no llama3 rescaling": (_no_rescaling, 0.0),
+            "llama3 factor 8 instead of 32": (_other_factor, 0.0),
+            "RoPE base 10000, no rescaling (the original bug)": (original_bug, 0.1),
+            "RMSNorm eps 1e-6 instead of 1e-5": (_other_eps, 0.0),
+        }, with_head=False, yardstick=False)
 
 
 if __name__ == "__main__":
