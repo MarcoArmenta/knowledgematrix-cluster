@@ -126,6 +126,11 @@ class GPT2(NN):
         from transformers import GPT2LMHeadModel
 
         hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
+        # transformers < 5 instantiates the model in torch's default dtype;
+        # v5 keeps the checkpoint's own dtype (float32) instead. Cast, so the
+        # network is in the default dtype under both (and `residual`'s shape
+        # probes, which use the default dtype, run through its layers).
+        hf_model = hf_model.to(torch.get_default_dtype())
 
         # Token embedding
         self.layers.append(hf_model.transformer.wte)

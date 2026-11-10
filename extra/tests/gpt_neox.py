@@ -56,6 +56,8 @@ class TestPretrainedPythia70m(unittest.TestCase):
                 m = GPTNeoX(pretrained=True, hf_name="EleutherAI/pythia-70m")
                 m.eval()
                 hf = GPTNeoXForCausalLM.from_pretrained("EleutherAI/pythia-70m")
+                # transformers 5.x loads the checkpoint in its stored dtype (float16); the gate below is a float32 one.
+                hf = hf.float()
                 hf.eval()
                 x = torch.tensor([[[3856, 11, 619, 1416, 310]]])
                 ours = m(x).squeeze(0)

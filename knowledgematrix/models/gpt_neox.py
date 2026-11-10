@@ -48,6 +48,10 @@ class GPTNeoX(NN):
     def _build_pretrained(self, hf_name, revision, causal):
         from transformers import GPTNeoXForCausalLM
         hf = GPTNeoXForCausalLM.from_pretrained(hf_name, revision=revision)
+        # transformers < 5 instantiates the model in torch's default dtype;
+        # v5 keeps the checkpoint's own dtype instead (float16 for the Pythia
+        # checkpoints). Cast, so the network is in the default dtype under both.
+        hf = hf.to(torch.get_default_dtype())
         cfg = hf.config
         assert cfg.use_parallel_residual, "only the parallel-residual NeoX variant is supported"
         # transformers <5 exposes rotary_pct/rotary_emb_base on the config; v5 consolidates
@@ -82,7 +86,8 @@ class GPTNeoX(NN):
                             ln2=block.post_attention_layernorm,
                             fc=block.mlp.dense_h_to_4h, proj=block.mlp.dense_4h_to_h)
         self.layers.append(hf.gpt_neox.final_layer_norm)
-        self.layers.append(hf.embed_out)
+        # the unembedding: `embed_out` in transformers < 5, `lm_head` in v5
+        self.layers.append(hf.get_output_embeddings())
 
     def block_boundaries(self) -> list:
         cuts = [1 + 6 * b for b in range(self.num_layers + 1)]
