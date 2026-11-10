@@ -12,6 +12,13 @@ import math
 from typing import Union, Dict, Tuple, List, Optional
 
 
+class _ParallelState:
+    """Per-pass bookkeeping for parallel-residual blocks."""
+    def __init__(self):
+        self.saved = {}
+        self.branch1 = {}
+
+
 class NN(nn.Module):
     """
         A class to build a neural network for which the knowledge matrix can be computed.
@@ -60,6 +67,29 @@ class NN(nn.Module):
         # pipelining of several inputs is attempted).
         self.layer_devices: Optional[List[str]] = None
         self.shard_boundaries: Optional[List[int]] = None
+        # Parallel residual blocks (GPT-NeoX): end -> (start, mid), meaning
+        # x_end = x_start + branch1(x_start) + branch2(x_start), with branch1 =
+        # layers[start:mid], branch2 = layers[mid:end]. The merge at `end`
+        # happens BEFORE layer `end` runs (same convention as residual ends).
+        self.parallel_blocks: Dict[int, Tuple[int, int]] = {}
+        # Snapshot convention at a layer index that is BOTH the end of one
+        # residual and the start of the next (two residual blocks with no
+        # layer in between, e.g. the sub-blocks of a pre-norm transformer):
+        #   False (default): the skip of the second block is the tensor
+        #       BEFORE the merge at that index. Chained blocks then need an
+        #       explicit `identity()` layer at each merge point, which is
+        #       what the LlamaLike / Qwen3_5 / Gemma models do.
+        #   True: the skip of the second block is the tensor AFTER the
+        #       merge, so residual(a, b); residual(b, c) computes
+        #       x_b = x_a + F(x_a), x_c = x_b + G(x_b) directly (GPT2).
+        # Networks without such a shared index are unaffected by the flag.
+        self.chained_residuals: bool = False
+        # If True, the save pass (`save=True`) also records in `self.stream`
+        # the tensor entering every layer, after all the wiring at that
+        # index (the cut values used by KnowledgeMatrixComputer.segment,
+        # which turns this on for its own reference pass). Off by default:
+        # it keeps one more tensor per layer alive.
+        self.save_stream: bool = False
 
 
     ### Linear Layers ###
@@ -554,6 +584,9 @@ class NN(nn.Module):
     def positionalencoding(self, d_model: int, max_len: int=5000) -> None:
         self.layers.append(PositionalEncoding(d_model, max_len))
 
+    def learned_positionalencoding(self, max_len: int, d_model: int) -> None:
+        self.layers.append(LearnedPositionalEncoding(max_len, d_model))
+
 
     ### Residual Connections ###
 
@@ -945,6 +978,23 @@ class NN(nn.Module):
         )
 
 
+    ### Parallel Residual Blocks ###
+
+    def parallel_step(self, i: int, x, st: "_ParallelState", seg_start: int = -1):
+        """Parallel-residual bookkeeping at loop index i (call BEFORE layer i).
+        The merge at a block end belongs to the upstream segment: it is skipped
+        when i == seg_start (the segment() trailing step applies it instead)."""
+        for end, (start, mid) in self.parallel_blocks.items():
+            if i == start:
+                st.saved[end] = x
+            elif i == mid:
+                st.branch1[end] = x
+                x = st.saved[end]
+            elif i == end and i != seg_start:
+                x = st.saved.pop(end) + st.branch1.pop(end) + x
+        return x
+
+
     ### Forward Method ###
 
     def forward(self, x: torch.Tensor, return_penultimate:bool=False) -> torch.Tensor:
@@ -961,14 +1011,19 @@ class NN(nn.Module):
         branch_snapshots: list[torch.Tensor] = [None] * self.get_num_layers()
         if not self.save:  # Regular forward pass
             layers = self.layers[:-1] if return_penultimate else self.layers
+            pstate = _ParallelState()
             for i, layer in enumerate(layers[start_layer:], start=start_layer):
                 x = self.to_layer_device(x, i)
+                if self.parallel_blocks:
+                    x = self.parallel_step(i, x, pstate)
                 if i in self.residuals_starts or i in self.concat_skips_starts:
                     inputs_residuals[i] = x
                 if i in self.branch_inputs:
                     x = self.to_layer_device(branch_snapshots[self.branch_inputs[i]], i)
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
+                    if self.chained_residuals and i in self.residuals_starts:
+                        inputs_residuals[i] = x  # the next block skips from the merged stream
                 if i in self.concat_skips:
                     x = self.apply_concat(x, inputs_residuals, layer=i)
                 if i in self.branch_inputs_starts:
@@ -985,19 +1040,27 @@ class NN(nn.Module):
             self.acts: list[torch.Tensor] = [None] * self.get_num_layers()
             self.maxpool_indices: list[torch.Tensor] = [None] * self.get_num_layers()
             self.layernorms: list[torch.Tensor] = [None] * self.get_num_layers()
+            self.stream: list = [None] * self.get_num_layers()
 
+            pstate = _ParallelState()
             for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
                 x = self.to_layer_device(x, i)
+                if self.parallel_blocks:
+                    x = self.parallel_step(i, x, pstate)
                 if i in self.residuals_starts or i in self.concat_skips_starts:
                     inputs_residuals[i] = x
                 if i in self.branch_inputs:
                     x = self.to_layer_device(branch_snapshots[self.branch_inputs[i]], i)
                 if i in self.residuals:
                     x = self.apply_residual(x, inputs_residuals, layer=i)
+                    if self.chained_residuals and i in self.residuals_starts:
+                        inputs_residuals[i] = x  # the next block skips from the merged stream
                 if i in self.concat_skips:
                     x = self.apply_concat(x, inputs_residuals, layer=i)
                 if i in self.branch_inputs_starts:
                     branch_snapshots[i] = x
+                if self.save_stream:
+                    self.stream[i] = x.detach().clone()
                 if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d, nn.BatchNorm2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.Linear, nn.Flatten, nn.Upsample, nn.PixelShuffle)):
                     x = layer(x)
                 elif isinstance(layer, nn.LayerNorm):
@@ -1023,7 +1086,12 @@ class NN(nn.Module):
                     self.maxpool_indices[i] = indices
                 elif isinstance(layer, ACTIVATION_LAYERS):
                     self.pre_acts[i] = x.detach().clone()
-                    x = layer(x)
+                    if isinstance(layer, MultiHeadAttention):
+                        layer.save_pattern = True
+                        x = layer(x)
+                        layer.save_pattern = False
+                    else:
+                        x = layer(x)
                     self.acts[i] = x.detach().clone()
         return x
 
@@ -1159,6 +1227,8 @@ class NN(nn.Module):
         spans = [(s, e) for e, pairs in self.residuals.items() for s, _ in pairs]
         spans += [(s, e) for e, srcs in self.concat_skips.items() for s in srcs]
         spans += [(s, e) for e, s in self.branch_inputs.items()]
+        # a parallel-residual block merges three tensors at its end
+        spans += [(s, e) for e, (s, _) in self.parallel_blocks.items()]
         first = self._get_start_layer() + 1
         return [c for c in range(first, n)
                 if not any(s < c <= e for s, e in spans)]
@@ -1312,7 +1382,7 @@ class NN(nn.Module):
         start_layer = 0
         if isinstance(self.layers[0], nn.Embedding):
             start_layer = 1
-            if isinstance(self.layers[1], PositionalEncoding):
+            if isinstance(self.layers[1], (PositionalEncoding, LearnedPositionalEncoding)):
                 start_layer = 2
         return start_layer
 
@@ -2178,6 +2248,24 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 
+class LearnedPositionalEncoding(nn.Module):
+    """
+        Learned positional encoding for decoder-only transformers (e.g. GPT-2).
+
+        Args:
+            max_len (int): The maximum sequence length.
+            d_model (int): The dimension of the model.
+    """
+    def __init__(self, max_len: int, d_model: int) -> None:
+        super().__init__()
+        self.pos_embedding = nn.Embedding(max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(-2)
+        position_ids = torch.arange(seq_len, device=x.device)
+        return x + self.pos_embedding(position_ids)
+
+
 class MultiHeadAttention(nn.Module):
     """
         Multi-head attention for the transformer model. 
@@ -2185,8 +2273,20 @@ class MultiHeadAttention(nn.Module):
         Args:
             d_model (int): The dimension of the model.
             num_heads (int): The number of heads.
-            mask (torch.Tensor): The mask to apply to the attention scores.
-        
+            num_kv_heads (int): The number of key/value heads (GQA / MQA);
+                defaults to num_heads.
+            mask (torch.Tensor): The mask to apply to the attention scores
+                (0 = masked). Its last two dimensions may exceed the
+                sequence length (e.g. a max_len x max_len causal mask).
+            rotary_pct (float): Fraction of each head's dimension that gets
+                a GPT-NeoX-style rotary position embedding on queries and
+                keys (0 disables it). It only changes the attention
+                pattern; the value path is untouched.
+            rope_base (int): The rotary base frequency.
+
+        In the save pass of NN.forward the attention pattern is kept in
+        `attn_pattern` (shape (1, 1, num_heads, T, T)) for inspection.
+
         Inspired by: https://medium.com/data-science/build-your-own-transformer-from-scratch-using-pytorch-84c850470dcb
         which is inspired by the Attention is All You Need paper.
     """
@@ -2195,7 +2295,9 @@ class MultiHeadAttention(nn.Module):
             d_model: int,
             num_heads: int,
             num_kv_heads: Union[int, None]=None,
-            mask: Union[torch.Tensor, None]=None
+            mask: Union[torch.Tensor, None]=None,
+            rotary_pct: float = 0.0,
+            rope_base: int = 10000
         ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
@@ -2214,47 +2316,76 @@ class MultiHeadAttention(nn.Module):
         self.d_head = d_model // num_heads
         self.kv_repeat = num_heads // num_kv_heads
         self.mask = mask
+        self.rotary_pct = rotary_pct
+        self.rope_base = rope_base
+        self.rotary_ndims = int(self.d_head * rotary_pct) if rotary_pct > 0 else 0
+
+        self.save_pattern = False
+        self.attn_pattern = None
 
         self.Q = nn.Linear(d_model, d_model)
         self.K = nn.Linear(d_model, num_kv_heads * self.d_head)
         self.V = nn.Linear(d_model, num_kv_heads * self.d_head)
         self.O = nn.Linear(d_model, d_model)
 
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor):
+        """GPT-NeoX-style partial rotary on the first rotary_ndims of q/k.
+        Shapes: (batch, B, H, T, d_head)."""
+        nd = self.rotary_ndims
+        T = q.shape[-2]
+        inv = 1.0 / (self.rope_base ** (torch.arange(0, nd, 2, device=q.device, dtype=q.dtype) / nd))
+        t = torch.arange(T, device=q.device, dtype=q.dtype)
+        emb = torch.cat([torch.outer(t, inv)] * 2, dim=-1)      # (T, nd)
+        cos, sin = emb.cos(), emb.sin()
+
+        def rot_half(x):
+            x1, x2 = x[..., : nd // 2], x[..., nd // 2: nd]
+            return torch.cat((-x2, x1), dim=-1)
+
+        outs = []
+        for src in (q, k):
+            rot, keep = src[..., :nd], src[..., nd:]
+            outs.append(torch.cat((rot * cos + rot_half(rot) * sin, keep), dim=-1))
+        return outs[0], outs[1]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, B, T, D = x.shape
 
-        Q = self.Q(x)
-        K = self.K(x)
-        V = self.V(x)
+        attn = self._attn_weights(x)
+        if self.save_pattern:
+            self.attn_pattern = attn.detach().clone()
 
-        Q = Q.view(batch, B, T, self.num_heads, self.d_head).transpose(2, 3)
-        K = K.view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
-        V = V.view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
-
+        V = self.V(x).view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
         if self.kv_repeat > 1:
-            K = K.repeat_interleave(self.kv_repeat, dim=-3)
             V = V.repeat_interleave(self.kv_repeat, dim=-3)
 
-        scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
-
-        if self.mask is not None:
-            scores = scores.masked_fill(self.mask == 0, float("-inf"))
-
-        attn = torch.softmax(scores, dim=-1)
         out = attn @ V
         out = out.transpose(2, 3).contiguous().view(batch, B, T, D)
         return self.O(out)
 
     def _attn_weights(self, x0: torch.Tensor) -> torch.Tensor:
-        """The softmax attention weights at the actual input x0."""
+        """
+            The softmax attention weights (the attention pattern) at the
+            actual input x0, of shape (batch, B, num_heads, T, T). Shared by
+            forward and the frozen linearization, so the two cannot drift
+            apart: the rotary embedding and the mask act here and only here.
+        """
         batch, B, T, D = x0.shape
         Q = self.Q(x0).view(batch, B, T, self.num_heads, self.d_head).transpose(2, 3)
         K = self.K(x0).view(batch, B, T, self.num_kv_heads, self.d_head).transpose(2, 3)
         if self.kv_repeat > 1:
             K = K.repeat_interleave(self.kv_repeat, dim=-3)
+        if self.rotary_ndims:
+            Q, K = self._apply_rope(Q, K)
         scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
         if self.mask is not None:
-            scores = scores.masked_fill(self.mask == 0, float("-inf"))
+            # A mask built for max_len (e.g. a causal tril) is cut to the
+            # actual sequence length; a mask already of size T (or one that
+            # broadcasts, e.g. a 1-D key mask) is used unchanged.
+            mask = self.mask
+            if mask.dim() >= 2:
+                mask = mask[..., :T, :T]
+            scores = scores.masked_fill(mask.to(scores.device) == 0, float("-inf"))
         return torch.softmax(scores, dim=-1)
 
     def frozen_forward(self, x: torch.Tensor, x0: torch.Tensor, affine: bool = True) -> torch.Tensor:

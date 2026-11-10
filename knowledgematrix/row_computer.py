@@ -8,6 +8,7 @@ from knowledgematrix.neural_net import (
     ACTIVATION_LAYERS,
     LINEARIZABLE_LAYERS,
     RMSNorm,
+    _ParallelState,
 )
 
 
@@ -130,17 +131,22 @@ class KnowledgeRowComputer:
         start_layer = model._get_start_layer()
         inputs_residuals = [None] * model.get_num_layers()
         branch_snapshots = [None] * model.get_num_layers()
+        pstate = _ParallelState()
 
         B = e
         for i, layer in enumerate(model.layers[start_layer:], start=start_layer):
             B = model.to_layer_device(B, i)   # no-op unless the model is sharded
             _zero = torch.tensor(0.0, device=B.device, dtype=e.dtype)
+            if model.parallel_blocks:
+                B = model.parallel_step(i, B, pstate)
             if i in model.residuals_starts or i in model.concat_skips_starts:
                 inputs_residuals[i] = B
             if i in model.branch_inputs:
                 B = model.to_layer_device(branch_snapshots[model.branch_inputs[i]], i)
             if i in model.residuals:
                 B = model.apply_residual(B, inputs_residuals, layer=i, affine=False)
+                if model.chained_residuals and i in model.residuals_starts:
+                    inputs_residuals[i] = B  # the next block skips from the merged stream
             if i in model.concat_skips:
                 B = model.apply_concat(B, inputs_residuals, layer=i)
             if i in model.branch_inputs_starts:
