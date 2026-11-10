@@ -1024,7 +1024,7 @@ class NN(nn.Module):
                     self.layernorms[i] = (torch.mean(x, dim=dims, keepdim=True), torch.var(x, dim=dims, unbiased=False, keepdim=True))
                     x = layer(x)
                 elif isinstance(layer, RMSNorm):
-                    self.layernorms[i] = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + layer.eps)
+                    self.layernorms[i] = layer.rms(x)
                     x = layer(x)
                 elif isinstance(layer, nn.GroupNorm):
                     G = layer.num_groups
@@ -1566,10 +1566,31 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.normalized_shape = (normalized_shape,)
 
+    def rms(self, x: torch.Tensor) -> torch.Tensor:
+        """
+            sqrt(mean(x^2) + eps) over the last dimension, in the dtype of
+            x. For a half-precision input the mean square is taken in
+            float32 (as the reference implementations do): accumulated in
+            bfloat16 it is off by ~3e-3, on every normalization of the
+            network.
+        """
+        if x.dtype in (torch.float16, torch.bfloat16):
+            h = x.float()
+            return torch.sqrt(torch.mean(h ** 2, dim=-1, keepdim=True) + self.eps).to(x.dtype)
+        return torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype in (torch.float16, torch.bfloat16):
+            # Half precision: normalize in float32, round once, then scale
+            # -- the arithmetic of the Hugging Face RMSNorm modules, so a
+            # bfloat16 network is as accurate as the bfloat16 reference
+            # (float32 and float64 are untouched by this branch).
+            h = x.float()
+            h = h * torch.rsqrt(torch.mean(h ** 2, dim=-1, keepdim=True) + self.eps)
+            return self.weight * h.to(x.dtype)
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return x * self.weight / rms
-   
+
 
 class RMSNormGated(nn.Module):
     """

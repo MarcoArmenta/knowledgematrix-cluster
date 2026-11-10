@@ -33,7 +33,8 @@
        real transformers class on the "meta" device (no memory): every
        tensor is located and shape-checked, parameter counts agree.
     6. LOADER MECHANICS -- sharding, copy / share, dtypes, damaged
-       checkpoints, hub arguments.
+       checkpoints, hub arguments; half precision (bfloat16) is as
+       accurate as the bfloat16 reference.
     7. REFUSALS -- configs the network does not reproduce raise.
     8. REAL WEIGHTS -- when a checkpoint is in the local Hugging Face
        cache (never downloaded here): our float32 network streamed from
@@ -49,6 +50,7 @@
     without them the whole file is skipped.
 """
 import contextlib
+import copy
 import gc
 import json
 import math
@@ -63,7 +65,6 @@ from torch.nn import functional as F
 from knowledgematrix.neural_net import (
     RMSNorm,
     RopeAttention,
-    SwiGLU,
     rope_inverse_frequencies,
 )
 from knowledgematrix.matrix_computer import KnowledgeMatrixComputer
@@ -425,8 +426,9 @@ def tiny(name: str):
     """(reference model, token ids, reference outputs) of the scaled-down
     copy of a checkpoint -- built once."""
     if name not in _TINY:
-        hf = build_reference(tiny_raw(name), seed=len(_TINY))
-        ids = token_ids(seed=100 + len(_TINY))
+        seed = list(CHECKPOINTS).index(name)       # the same whatever tests run
+        hf = build_reference(tiny_raw(name), seed=seed)
+        ids = token_ids(seed=100 + seed)
         _TINY[name] = (hf, ids, reference_outputs(hf, ids))
     return _TINY[name]
 
@@ -1389,6 +1391,86 @@ class TestLoaderMechanics(unittest.TestCase):
             for key in disk.keys():
                 self.assertTrue(torch.equal(disk.tensor(key), memory.tensor(key)), key)
             disk.close()
+
+
+### Half precision ###
+
+@unittest.skipUnless(HAS_TRANSFORMERS, "transformers / safetensors are not installed")
+class TestHalfPrecision(unittest.TestCase):
+    """
+        bfloat16 is the dtype the large checkpoints have to run in. Half
+        precision cannot agree with float32 beyond a few percent, but our
+        network must not be LESS accurate than the transformers model in
+        the same dtype. The one place where the two differed is RMSNorm:
+        the reference normalizes in float32 whatever the dtype, and ours
+        accumulated the mean square in bfloat16 (on real SmolLM2-135M
+        weights that doubled the worst logit error against float32, 0.21
+        of the logit scale instead of the reference's 0.10).
+    """
+
+    def test_rmsnorm_is_the_reference_in_half_precision(self):
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm
+        g = torch.Generator().manual_seed(0)
+        for dtype in (torch.bfloat16, torch.float16):
+            for eps in (1e-5, 1e-6):
+                ours, theirs = RMSNorm(96, eps=eps), LlamaRMSNorm(96, eps=eps)
+                weight = 1.0 + 0.3 * torch.randn(96, generator=g)
+                with torch.no_grad():
+                    ours.weight.copy_(weight)
+                    theirs.weight.copy_(weight)
+                ours, theirs = ours.to(dtype), theirs.to(dtype)
+                x = (4.0 * torch.randn(3, 7, 96, generator=g)).to(dtype)
+                with torch.no_grad():
+                    out = ours(x)
+                    self.assertEqual(out.dtype, dtype)
+                    self.assertTrue(torch.equal(out, theirs(x)), f"{dtype} eps={eps}")
+                    # the denominator kept for the knowledge matrix: the
+                    # exact one rounded once (half an ulp: 2^-9 in
+                    # bfloat16), where bfloat16 arithmetic loses more
+                    exact = torch.sqrt((x.double() ** 2).mean(-1, keepdim=True) + eps)
+                    kept = ours.rms(x)
+                    self.assertEqual(kept.dtype, dtype)
+                    self.assertLess(((kept.double() - exact) / exact).abs().max().item(), 2.0 ** -8)
+                    naive = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + eps)
+                    self.assertLessEqual(((kept.double() - exact) / exact).abs().max().item(),
+                                         ((naive.double() - exact) / exact).abs().max().item())
+
+    def test_rmsnorm_is_unchanged_in_single_and_double_precision(self):
+        g = torch.Generator().manual_seed(1)
+        for dtype in (torch.float32, torch.float64):
+            norm = RMSNorm(96, eps=1e-5).to(dtype)
+            with torch.no_grad():
+                norm.weight.copy_(1.0 + 0.3 * torch.randn(96, generator=g))
+            x = torch.randn(3, 7, 96, generator=g).to(dtype)
+            rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-5)
+            with torch.no_grad():
+                self.assertTrue(torch.equal(norm.rms(x), rms))
+                self.assertTrue(torch.equal(norm(x), x * norm.weight / rms))
+
+    def test_half_precision_network_is_as_accurate_as_the_reference(self):
+        worst = 0.0
+        for name in CHECKPOINTS:
+            hf, ids, outputs = tiny(name)
+            truth = outputs["exact_logits"]
+            scale = truth.abs().max().item()
+            half = copy.deepcopy(hf).to(torch.bfloat16)
+            with torch.no_grad():
+                theirs = half(ids).logits
+            net = LlamaLike.from_huggingface(half)       # keeps the model's dtype
+            self.assertEqual({p.dtype for p in net.parameters()}, {torch.bfloat16})
+            ours = run(net, ids)
+            self.assertEqual(ours.dtype, torch.bfloat16)
+            reference_error = gap(theirs, truth) / scale
+            our_error = gap(ours, truth) / scale
+            note("half precision", f"{name}: transformers bfloat16 vs float64", reference_error, scale)
+            note("half precision", f"{name}: ours bfloat16 vs float64", our_error, scale)
+            note("half precision", f"{name}: ours vs transformers, both bfloat16",
+                 gap(ours, theirs) / scale, scale)
+            with self.subTest(name=name):
+                self.assertLess(reference_error, 0.1)
+                self.assertLess(our_error, 1.5 * reference_error)
+            worst = max(worst, our_error / reference_error)
+        note("half precision", "worst ratio of our error to the reference's", worst)
 
 
 ### 7. Family variants and refusals ###
