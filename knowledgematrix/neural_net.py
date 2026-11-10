@@ -518,7 +518,8 @@ class NN(nn.Module):
             bias: bool=False,
             o_bias: bool=False,
             causal: bool=True,
-            rope_float32: bool=False
+            rope_float32: bool=False,
+            rope_scaling: Union[dict, None]=None
         ) -> None:
         self.layers.append(
             RopeAttention(
@@ -536,7 +537,8 @@ class NN(nn.Module):
                 bias=bias,
                 o_bias=o_bias,
                 causal=causal,
-                rope_float32=rope_float32
+                rope_float32=rope_float32,
+                rope_scaling=rope_scaling
             )
         )
 
@@ -557,9 +559,26 @@ class NN(nn.Module):
 
     ### Residual Connections ###
 
-    def residual(self, start: int, end: int) -> None:
-        shape_start = self.shape_at_layer(start)
-        shape_end = self.shape_at_layer(end)
+    def residual(self, start: int, end: int, same_shape: bool=False) -> None:
+        """
+            Register a residual connection: the tensor entering layer
+            `start` is added to the tensor entering layer `end`.
+
+            By default the two shapes are probed with a forward pass up to
+            each index, and a projection (1x1 conv + batchnorm, or a
+            linear layer) is inserted when they differ. `same_shape=True`
+            asserts that they are equal and skips the probes: a network of
+            L residual blocks otherwise costs O(L^2) layer evaluations to
+            BUILD, which for a transformer of several billion parameters
+            is minutes of work on weights that are about to be overwritten
+            by a checkpoint (and impossible on a network built without
+            storage, see models/_hf.py::empty_network).
+        """
+        if same_shape:
+            shape_start = shape_end = None
+        else:
+            shape_start = self.shape_at_layer(start)
+            shape_end = self.shape_at_layer(end)
         if (start < end):
             if shape_start == shape_end:
                 projection = [nn.Identity()]
@@ -1190,10 +1209,45 @@ class NN(nn.Module):
         devices = [str(d) for d in devices]
         if len(devices) == 0:
             raise ValueError("shard needs at least one device.")
+        if len(devices) == 1:
+            return self.unshard(devices[0])
+        layer_devices, boundaries = self.shard_layout(devices, boundaries)
+        with torch.no_grad():
+            for i, layer in enumerate(self.layers):
+                layer.to(layer_devices[i])
+            # projection modules live with the layer that applies them
+            for end, pairs in self.residuals.items():
+                for _, proj in pairs:
+                    for module in proj:
+                        module.to(layer_devices[end])
+        self.layer_devices = layer_devices
+        self.shard_boundaries = boundaries
+        self.device = devices[0]
+        return self
+
+    def shard_layout(
+            self,
+            devices: List[str],
+            boundaries: Optional[List[int]] = None
+        ) -> Tuple[List[str], List[int]]:
+        """
+            The placement `shard` would produce, without moving anything:
+            the device of every layer and the cut indices. Only parameter
+            COUNTS are used, so this also works on a network that has no
+            storage yet -- the checkpoint loaders use it to send each
+            tensor straight to its final device (models/_hf.py).
+
+            Args:
+                devices (List[str]): one device per stage (at least two).
+                boundaries (List[int] | None): as in `shard`.
+            Returns:
+                (layer_devices, boundaries)
+        """
+        devices = [str(d) for d in devices]
         n = self.get_num_layers()
         k = len(devices)
-        if k == 1:
-            return self.unshard(devices[0])
+        if k < 2:
+            raise ValueError("shard_layout needs at least two devices.")
         allowed = self.shard_cut_points()
         if boundaries is None:
             counts = [sum(p.numel() for p in layer.parameters()) for layer in self.layers]
@@ -1229,18 +1283,7 @@ class NN(nn.Module):
         layer_devices = []
         for stage in range(k):
             layer_devices += [devices[stage]] * (edges[stage + 1] - edges[stage])
-        with torch.no_grad():
-            for i, layer in enumerate(self.layers):
-                layer.to(layer_devices[i])
-            # projection modules live with the layer that applies them
-            for end, pairs in self.residuals.items():
-                for _, proj in pairs:
-                    for module in proj:
-                        module.to(layer_devices[end])
-        self.layer_devices = layer_devices
-        self.shard_boundaries = boundaries
-        self.device = devices[0]
-        return self
+        return layer_devices, boundaries
 
     def unshard(self, device: Union[str, None] = None) -> "NN":
         """
@@ -1420,6 +1463,98 @@ def _ft_arg(node: fx.Node, idx: int, key: str, default=None):
     return default
 
 
+#: RoPE frequency rescalings implemented by `rope_inverse_frequencies`.
+#: The other Hugging Face types ("yarn", "dynamic", "longrope",
+#: "proportional") also rescale the cos/sin tables or depend on the
+#: sequence length; they are refused rather than silently approximated.
+SUPPORTED_ROPE_TYPES = ("default", "linear", "llama3")
+
+
+def _normalize_rope_scaling(scaling: Union[dict, None]) -> Union[dict, None]:
+    """
+        Validate a RoPE rescaling given in the Hugging Face
+        ``rope_parameters`` / ``rope_scaling`` format and reduce it to the
+        keys that define the frequencies. Returns None for the plain table.
+    """
+    if scaling is None:
+        return None
+    rope_type = scaling.get("rope_type", scaling.get("type", "default"))
+    if rope_type is None or rope_type == "default":
+        return None
+    if rope_type not in SUPPORTED_ROPE_TYPES:
+        raise NotImplementedError(
+            f"RoPE type {rope_type!r} is not supported (supported: "
+            f"{', '.join(SUPPORTED_ROPE_TYPES)}); refusing to build an "
+            f"attention layer that would rotate by the wrong angles."
+        )
+    if "factor" not in scaling:
+        raise ValueError(f"RoPE type {rope_type!r} needs a 'factor'.")
+    out = {"rope_type": rope_type, "factor": float(scaling["factor"])}
+    if rope_type == "llama3":
+        for key in ("low_freq_factor", "high_freq_factor", "original_max_position_embeddings"):
+            if key not in scaling:
+                raise ValueError(f"RoPE type 'llama3' needs {key!r}.")
+            out[key] = float(scaling[key])
+    return out
+
+
+def rope_inverse_frequencies(
+        dim: int,
+        theta: float,
+        scaling: Union[dict, None] = None,
+        dtype: torch.dtype = torch.float64,
+        device=None
+    ) -> torch.Tensor:
+    """
+        The dim/2 rotation frequencies of a rotary position embedding,
+
+            w_i = theta ** (-2i / dim),      i = 0, ..., dim/2 - 1,
+
+        optionally rescaled the way the reference checkpoints do:
+
+        - ``linear``:  w_i / factor                      (Gemma-3 global layers)
+        - ``llama3``:  with wavelength l_i = 2 pi / w_i and the context
+          length L the base model was trained on,
+              l_i < L / high_freq_factor  ->  w_i              (kept)
+              l_i > L / low_freq_factor   ->  w_i / factor     (slowed)
+              in between                  ->  a linear blend in
+                  s_i = (L / l_i - low_freq_factor) / (high_freq_factor - low_freq_factor):
+                  (1 - s_i) * w_i / factor + s_i * w_i
+          (Llama-3.1 / 3.2 / 3.3).
+
+        Everything is evaluated in `dtype`, so float64 gives the exact
+        table and float32 reproduces the reference implementation
+        (transformers.modeling_rope_utils), which works in float32.
+
+        Args:
+            dim (int): Number of rotated dimensions (even).
+            theta (float): The RoPE base.
+            scaling (dict | None): see RopeAttention.
+            dtype (torch.dtype): Precision of the computation.
+            device: Device of the returned tensor.
+        Returns:
+            torch.Tensor: The frequencies, shape (dim // 2,).
+    """
+    scaling = _normalize_rope_scaling(scaling)
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=dtype, device=device) / dim))
+    if scaling is None:
+        return inv_freq
+    factor = scaling["factor"]
+    if scaling["rope_type"] == "linear":
+        return inv_freq / factor
+    # llama3
+    low, high = scaling["low_freq_factor"], scaling["high_freq_factor"]
+    old_len = scaling["original_max_position_embeddings"]
+    low_freq_wavelen = old_len / low
+    high_freq_wavelen = old_len / high
+    wavelen = 2 * math.pi / inv_freq
+    scaled = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    smooth = (old_len / wavelen - low) / (high - low)
+    smoothed = (1 - smooth) * scaled / factor + smooth * scaled
+    is_medium = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+    return torch.where(is_medium, smoothed, scaled)
+
+
 class RMSNorm(nn.Module):
     """
         Root Mean Square Layer Normalization.
@@ -1567,6 +1702,17 @@ class RopeAttention(nn.Module):
             rms_norm_eps (float): epsilon of the optional q/k norms.
             bias (bool): Whether the projections have biases.
             causal (bool): Apply the causal mask.
+            rope_float32 (bool): Build the RoPE tables from float32
+                frequencies, reproducing the reference rounding.
+            rope_scaling (dict | None): frequency rescaling of the RoPE
+                table, in the Hugging Face ``rope_parameters`` format:
+                ``{"rope_type": "llama3", "factor": 8.0, "low_freq_factor":
+                1.0, "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192}`` (Llama-3.1 /
+                3.2 / 3.3) or ``{"rope_type": "linear", "factor": 8.0}``
+                (the global layers of Gemma-3 4b/12b/27b). None or
+                ``{"rope_type": "default"}`` is the plain table. See
+                `rope_inverse_frequencies`.
     """
     def __init__(
             self,
@@ -1584,7 +1730,8 @@ class RopeAttention(nn.Module):
             bias: bool = False,
             o_bias: bool = False,
             causal: bool = True,
-            rope_float32: bool = False
+            rope_float32: bool = False,
+            rope_scaling: Union[dict, None] = None
         ) -> None:
         super().__init__()
         if num_kv_heads is None:
@@ -1620,6 +1767,7 @@ class RopeAttention(nn.Module):
         # measured), and in float64 ours is the correct one. Set True only
         # to reproduce HF's float32 rounding on purpose.
         self.rope_float32 = rope_float32
+        self.rope_scaling = _normalize_rope_scaling(rope_scaling)
 
         self.q_proj = nn.Linear(d_model, num_heads * head_dim, bias=bias)
         self.k_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=bias)
@@ -1640,8 +1788,8 @@ class RopeAttention(nn.Module):
         # rope_float32=True reproduces that rounding on purpose; the default
         # is the exact table (see __init__ for why).
         idt = torch.float32 if self.rope_float32 else rdt
-        inv_freq = 1.0 / (
-            self.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=idt, device=device) / self.rotary_dim)
+        inv_freq = rope_inverse_frequencies(
+            self.rotary_dim, self.rope_theta, self.rope_scaling, dtype=idt, device=device
         )
         inv_freq = inv_freq.to(rdt)
         pos = torch.arange(T, dtype=rdt, device=device)
