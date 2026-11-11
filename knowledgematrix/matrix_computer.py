@@ -213,12 +213,24 @@ class KnowledgeMatrixComputer:
                         pre_act = self.model.pre_acts[i]
                         post_act = self.model.acts[i]
                         vertices = post_act / pre_act
+                        undefined = torch.isnan(vertices) | torch.isinf(vertices)
                         vertices = torch.where(
-                            torch.isnan(vertices) | torch.isinf(vertices),
+                            undefined,
                             _zero,
                             vertices
                         )
                         a = a * vertices
+                        # Where the ratio does not exist (a pre-activation of
+                        # exactly 0), what the layer outputs cannot be
+                        # attributed to that input coordinate: it is a
+                        # constant of the linearization and belongs to the
+                        # bias column, or the row would no longer sum to the
+                        # output. It is 0 for an activation with f(0) = 0,
+                        # but not for a sigmoid, nor for a mixing layer
+                        # (attention, gated MLP) fed by a norm whose scale is
+                        # exactly 0 in some coordinate -- which trained
+                        # checkpoints do contain (Gemma-3).
+                        a = a + torch.where(undefined & torch.isfinite(post_act), post_act, _zero)
                     elif isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.Flatten, nn.Linear, nn.Upsample, nn.PixelShuffle)):
                         a = layer(a)
                     elif isinstance(layer, nn.LayerNorm):
