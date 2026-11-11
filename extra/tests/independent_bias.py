@@ -472,6 +472,45 @@ class TestTheCheckCanFail(unittest.TestCase):
         self.assertLess((rows - mat[ROWS]).abs().max().item(), TOL)   # the same (wrong) rows
 
 
+class TestSinglePrecision(unittest.TestCase):
+    """
+        In float32 the identity holds to rounding only, and the rounding is
+        that of the terms being added, not of the output: a ratio-mode row
+        has entries far larger than the logit they sum to (on the real
+        pythia-70m weights: entries of 1.4e5 for logits of 1e3). So the
+        gap is to be read relative to the sum of the absolute entries of
+        the row. Measured, healthy / with the row pass off by 1 %:
+        float64 2e-16 / 1e-3, float32 5e-8 to 4e-6 / 1e-3 (tiny random
+        networks; pythia-70m: 1e-7 / 4e-4 in float32).
+        (bfloat16 is NOT separated: 3e-3 to 7e-2 healthy on these networks,
+        the same as with the 1 % error. The check needs float32 or float64.)
+    """
+
+    @staticmethod
+    def normalized_gap(comp, x):
+        rows = comp.forward(x, ROWS, independent_bias=True)
+        return ((rows.sum(1) - comp.row_outputs).abs() / rows.abs().sum(1)).max().item()
+
+    def test_float32(self):
+        x = tokens()
+        for name, build in (("llama with biases", llama_with_biases), ("llama", llama_plain)):
+            for mode in ("frozen", "ratio"):
+                with self.subTest(network=name, mixer_mode=mode):
+                    net = build(torch.float32)
+                    healthy = self.normalized_gap(KnowledgeRowComputer(net, mixer_mode=mode), x)
+                    broken = self.normalized_gap(ScaledRowPass(net, mixer_mode=mode), x)
+                    self.assertLess(healthy, 1e-4)
+                    self.assertGreater(broken, 5e-4)
+
+    def test_float64(self):
+        x = tokens()
+        for mode in ("frozen", "ratio"):
+            with self.subTest(mixer_mode=mode):
+                net = llama_with_biases()
+                self.assertLess(self.normalized_gap(KnowledgeRowComputer(net, mixer_mode=mode), x), 1e-13)
+                self.assertGreater(self.normalized_gap(ScaledRowPass(net, mixer_mode=mode), x), 5e-4)
+
+
 ### 4. Networks split over devices ###
 
 def second_device():

@@ -108,6 +108,11 @@ class KnowledgeRowComputer:
                     then the actual bias of the row, and
                     `rows.sum(1) == row_outputs` is a check that fails when
                     the linearization is wrong. Ignored with extract_weff.
+                    The identity holds to the rounding of the terms added,
+                    so read the gap relative to `rows.abs().sum(1)`
+                    (measured: 2e-16 in float64, 5e-8 to 4e-6 in float32,
+                    against 1e-3 for a 1 % error in the row pass; half
+                    precision, at 3e-3 to 7e-2, is too coarse for it).
             Returns:
                 torch.Tensor: The requested rows. The network outputs at
                     those rows, from the same reference pass, are left in
@@ -141,9 +146,10 @@ class KnowledgeRowComputer:
             weff_rows.append(grad.reshape(-1))
         W = torch.stack(weff_rows)  # (len(rows), input_size)
 
-        out_flat = out0.reshape(-1).to(self.device)
+        # (only the requested entries leave the device of the last layer,
+        # not the whole output)
         row_idx = torch.as_tensor(list(rows), device=self.device)
-        self.row_outputs = out_flat[row_idx]
+        self.row_outputs = out0.reshape(-1)[row_idx.to(out0.device)].to(self.device)
 
         if extract_weff:
             return W
@@ -152,7 +158,7 @@ class KnowledgeRowComputer:
         if independent_bias:
             bias = self._independent_bias(out0, row_idx)
         else:
-            bias = out_flat[row_idx] - A.sum(dim=1)
+            bias = self.row_outputs - A.sum(dim=1)
         return torch.cat((A, bias.unsqueeze(1)), dim=1)
 
     def _independent_bias(self, out0: torch.Tensor, row_idx: torch.Tensor) -> torch.Tensor:
