@@ -271,6 +271,20 @@ class TestLoadLLM(unittest.TestCase):
         self.assertEqual(ours.data_ptr(), source.data_ptr())
         self.assertTrue(load_llm(hf, save=True).save)
 
+    def test_loader_options_reach_the_family_loader(self):
+        # Gemma-2's final soft-cap is the loader's own option
+        hf, ids, reference = tiny_reference("google/gemma-2-2b")
+        capped = forward(load_llm(hf, dtype=torch.float64), ids)
+        plain = forward(load_llm(hf, dtype=torch.float64, final_softcap=False), ids)
+        self.assertLess(relative_gap(reference, capped), TOL)
+        self.assertGreater(relative_gap(reference, plain), 1e-2)
+        cap = hf.config.final_logit_softcapping
+        self.assertLess(relative_gap(capped, cap * torch.tanh(plain / cap)), 1e-12)
+        # an option no loader knows is an error, not silently dropped
+        hf, ids, _ = tiny_reference("HuggingFaceTB/SmolLM2-135M")
+        with self.assertRaises(TypeError):
+            load_llm(hf, final_softcap=False)
+
     def test_unsupported_architecture_is_refused_before_any_weight_is_read(self):
         folder = tempfile.mkdtemp()
         try:

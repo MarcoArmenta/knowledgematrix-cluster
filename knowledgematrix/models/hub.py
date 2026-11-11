@@ -95,6 +95,9 @@ FAMILIES: Dict[str, str] = {
 #: model types that are multimodal wrappers around a text decoder
 _WRAPPERS = ("gemma3", "qwen3_5")
 
+#: keyword arguments that address the hub (the rest are loader options)
+_HUB_OPTIONS = ("revision", "local_files_only", "token", "cache_dir")
+
 
 def family_class(family: str):
     """The network class of an architecture family ("llama", "gemma", "qwen3_5")."""
@@ -160,7 +163,7 @@ def load_llm(
         save: bool = False,
         copy: bool = True,
         boundaries: Optional[List[int]] = None,
-        **hub_kwargs,
+        **options,
     ) -> NN:
     """
         Build the knowledge-matrix network of a pretrained language model.
@@ -190,12 +193,15 @@ def load_llm(
                 or share them (False).
             boundaries (list[int] | None): pipeline cut indices (see
                 NN.shard); default balances the parameter count.
-            **hub_kwargs: revision, local_files_only, token, cache_dir.
+            **options: for the hub -- revision, local_files_only, token,
+                cache_dir -- and the options of the family's own loader
+                (GemmaLike.from_huggingface: final_softcap, embed_scale).
         Returns:
             NN: a LlamaLike, GemmaLike or Qwen3_5.
     """
     if isinstance(source, (str, os.PathLike)):
         source = resolve_llm(os.fspath(source))
+    hub_kwargs = {k: v for k, v in options.items() if k in _HUB_OPTIONS}
     cls = llm_class(_model_type(source, hub_kwargs))
     return cls.from_huggingface(
         source,
@@ -205,7 +211,7 @@ def load_llm(
         save=save,
         copy=copy,
         boundaries=boundaries,
-        **hub_kwargs,
+        **options,
     )
 
 

@@ -23,48 +23,151 @@ pip install git+https://github.com/samueleblanc/knowledgematrix.git
 
 For an example on how to use, please refer to [example.py](example.py).
 
-## Large language models (Qwen3.5)
+## Large language models
 
-The library supports the hybrid Qwen3.5 / Qwen3-Next decoder architecture
-(Gated DeltaNet linear attention, gated full attention with QK-Norm and
-partial RoPE, SwiGLU, RMSNorm). Pretrained weights are loaded through the
-optional dependency [transformers](https://github.com/huggingface/transformers)
-(`pip install "knowledgematrix[hf]"`):
+The library rebuilds a pretrained decoder as an `NN` computing the same
+function as the Hugging Face model, so its knowledge matrices can be
+computed. Loading needs the optional dependencies
+(`pip install "knowledgematrix[hf]"`: transformers, safetensors,
+huggingface_hub).
 
 ```python
 from transformers import AutoTokenizer
-from knowledgematrix.models.qwen3_5 import Qwen3_5
-from knowledgematrix.matrix_computer import KnowledgeMatrixComputer
+from knowledgematrix.models.hub import load_llm
+from knowledgematrix.row_computer import KnowledgeRowComputer
 
-model = Qwen3_5.from_huggingface("Qwen/Qwen3.5-4B")
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
+name = "HuggingFaceTB/SmolLM2-135M"          # or just "SmolLM2-135M"
+model = load_llm(name)
+tokenizer = AutoTokenizer.from_pretrained(name)
 
-x = tokenizer("Hello world", return_tensors="pt").input_ids.unsqueeze(0)  # (1, 1, seq_len)
-computer = KnowledgeMatrixComputer(model, batch_size=32)
-mat = computer.forward(x)  # (seq_len * vocab_size, seq_len * hidden_size + 1)
+x = tokenizer("The capital of France is", return_tensors="pt").input_ids.unsqueeze(0)  # (1, 1, T)
+logits = model.forward(x)                    # (1, 1, T, vocab)
+
+# the knowledge-matrix rows of the three most likely next tokens
+T, V = logits.shape[-2], logits.shape[-1]
+rows = [(T - 1) * V + v for v in logits[0, 0, -1].topk(3).indices.tolist()]
+M = KnowledgeRowComputer(model).forward(x, rows)   # (3, T * hidden + 1); each row sums to its logit
 ```
 
-Note on size: with the language-model head the matrix has
-`seq_len * vocab_size` rows, which is very large for a 4B model. Pass
-`include_lm_head=False` to `from_huggingface` to stop at the final hidden
-states (`seq_len * hidden_size` rows); since the head is linear, its rows
-can be pushed through afterwards for the logits you need.
+`load_llm` takes the name of a supported checkpoint, any hub repository or
+local directory holding a checkpoint of a supported architecture (an
+instruct variant, a fine-tune, an ungated mirror), or a transformers model
+already in memory. It picks the network class from the checkpoint's config:
 
-Two primitives for interpretability studies at LLM scale:
+| Family | `config.model_type` | Class | Checkpoints the tests are built on |
+|---|---|---|---|
+| Llama | `llama`, `mistral`, `ministral`, `qwen2`, `qwen3` | `LlamaLike` | Llama-3.1-8B, Llama-3.2-1B / 3B, Llama-3.3-70B-Instruct, SmolLM2-135M / 360M / 1.7B, Qwen3-8B / 14B |
+| Gemma | `gemma2`, `gemma3`, `gemma3_text` | `GemmaLike` | Gemma-2 2b / 9b / 27b, Gemma-3 270m / 1b / 4b / 12b / 27b |
+| Qwen3.5 | `qwen3_5`, `qwen3_5_text` | `Qwen3_5` | Qwen3.5-0.8B / 2B / 4B / 9B / 27B |
 
-* **Cross-token attribution** — by default the token-mixing layers are
-  linearized by the elementwise post/pre activation ratio, which keeps
-  attribution within each token position (the matrix is block diagonal over
-  positions). `KnowledgeMatrixComputer(model, mixer_mode="frozen")` instead
-  applies attention / DeltaNet / SwiGLU as linear maps with their routing
-  (attention weights, recurrence gates, GLU gates) frozen at the actual
-  input: attribution then flows across positions through the value paths.
-  Both modes reproduce the forward pass exactly (`mat.sum(1) == forward`).
-* **Row extraction** — `KnowledgeRowComputer(model).forward(x, rows)`
-  computes selected rows of the knowledge matrix by reverse mode (one
-  vector-Jacobian product per row, about one forward pass each), instead of
-  all columns. This is the efficient direction when a few output rows (e.g.
-  the logits of an answer token) are needed over many input coordinates.
+`knowledgematrix.models.hub.SUPPORTED_LLMS` lists them with their
+repositories. An architecture or a config option the library does not
+reproduce (a mixture-of-experts variant, bidirectional attention, an
+unsupported RoPE type, ...) is refused with an error rather than loaded as
+something else. The multimodal checkpoints (Gemma-3 4b and larger, Qwen3.5)
+are supported as text models: the vision tower is ignored. GPT-2 and
+GPT-NeoX / Pythia have their own adapters (`models/gpt2.py`,
+`models/gpt_neox.py`).
+
+### Which matrix
+
+With the LM head the matrix has `T * vocab` rows and `T * hidden + 1`
+columns, far too large to build in full for a real model. Two things make
+it tractable:
+
+* **Rows instead of columns** — `KnowledgeRowComputer(model).forward(x, rows)`
+  computes selected rows by reverse mode, one backward pass per row
+  whatever the input size. This is the efficient direction when a few
+  outputs (the logits of some answer tokens) are studied over all inputs.
+  `KnowledgeMatrixComputer(model).forward(x)` builds every column and is
+  for short prompts and small models.
+* **Stopping before the head** — `load_llm(name, include_lm_head=False)`
+  ends the network at the final norm (`T * hidden` rows). The head is a
+  linear map, so the rows of any logit follow from these.
+
+How the token-mixing layers are linearized is a choice (`mixer_mode`):
+
+* `"ratio"` — attention, the gated MLPs and the linear-attention recurrence
+  are treated like activations, by the elementwise post/pre ratio.
+  Attribution stays within each token position (the matrix is block
+  diagonal over positions). Default of `KnowledgeMatrixComputer`.
+* `"frozen"` — each such layer is applied as a linear map with its routing
+  (attention weights, recurrence gates, MLP gates) frozen at the actual
+  input, so attribution flows across positions through the value paths.
+  Default of `KnowledgeRowComputer`, and the mode to use for cross-token
+  attribution.
+
+Both reproduce the forward pass exactly: every row sums to its output.
+Gemma-2 soft-caps its final logits; the cap is a layer of the network
+(`SoftCap`), so the rows sum to the capped logits the model actually
+outputs (`load_llm(..., final_softcap=False)` gives the uncapped ones).
+
+### Large models
+
+A checkpoint is read from its safetensors files one tensor at a time,
+without instantiating the transformers model, and each tensor goes straight
+to the device of the layer that owns it. Host memory stays at one tensor.
+
+```python
+import torch
+from knowledgematrix.models.hub import load_llm, llm_footprint
+
+# what will it take? (from the config alone: nothing is downloaded or allocated)
+llm_footprint("meta-llama/Llama-3.3-70B-Instruct", dtype=torch.bfloat16,
+              devices=["cuda:0", "cuda:1", "cuda:2"], include_lm_head=False)
+# {'parameters': 69503033344, 'gib': 129.5, 'per_device': [{'device': 'cuda:0', 'gib': 43.4, ...}, ...]}
+
+model = load_llm("meta-llama/Llama-3.3-70B-Instruct", dtype=torch.bfloat16,
+                 device=["cuda:0", "cuda:1", "cuda:2"], include_lm_head=False)
+```
+
+* `dtype` defaults to float32. bfloat16 halves the memory, at the price of
+  the row-sum identity holding to about 1e-2 instead of 1e-6: it is a
+  storage format, to be used when the model does not fit otherwise.
+* `device` may be a list: the network is then a pipeline over the devices,
+  cut at block boundaries that balance the parameter count (`boundaries=`
+  to choose them; see `NN.shard`).
+* The gated repositories (Llama, Gemma) need a hub token with access
+  (`huggingface-cli login`, or `token=`).
+
+Weights of the network without its LM head, i.e. the minimum to hold
+(activations come on top and grow with the sequence length):
+
+| Checkpoint | Parameters | bfloat16 (GiB) | float32 (GiB) |
+|---|---|---|---|
+| SmolLM2-135M / 360M / 1.7B | 0.13 B / 0.36 B / 1.71 B | 0.3 / 0.7 / 3.2 | 0.5 / 1.3 / 6.4 |
+| Llama-3.2-1B / 3B | 1.24 B / 3.21 B | 2.3 / 6.0 | 4.6 / 12.0 |
+| Llama-3.1-8B | 7.50 B | 14.0 | 28.0 |
+| Llama-3.3-70B-Instruct | 69.50 B | 129.5 | 258.9 |
+| Qwen3-8B / 14B | 7.57 B / 13.99 B | 14.1 / 26.1 | 28.2 / 52.1 |
+| Qwen3.5-4B / 27B | 4.21 B / 25.62 B | 7.8 / 47.7 | 15.7 / 95.5 |
+| Gemma-2 2b / 9b / 27b | 2.61 B / 9.24 B / 27.23 B | 4.9 / 17.2 / 50.7 | 9.7 / 34.4 / 101.4 |
+| Gemma-3 270m / 1b / 4b / 12b / 27b | 0.27 B / 1.00 B / 3.88 B / 11.77 B / 27.01 B | 0.5 / 1.9 / 7.2 / 21.9 / 50.3 | 1.0 / 3.7 / 14.5 / 43.8 / 100.6 |
+
+### Checking a checkpoint
+
+```
+python -m knowledgematrix.models.verify meta-llama/Llama-3.2-3B --tokens 256
+python -m knowledgematrix.models.verify meta-llama/Llama-3.3-70B-Instruct \
+    --dtype bfloat16 --device cuda:0,cuda:1,cuda:2 --reference-device-map auto --tokens 256
+```
+
+computes the logits with transformers, frees that model, loads the
+knowledge-matrix network and reports the gap between the two relative to
+the logit scale, the agreement on the top token, and the knowledge-matrix
+row sums. The two models are never in memory together.
+
+What the test suite establishes, and what it cannot: for every checkpoint
+above, the real transformers class is instantiated on the published config
+with only its sizes scaled down, and the network must reproduce it — with
+negative controls showing that each mechanism (RoPE base and rescaling,
+q/k normalization, sliding windows, soft-caps, head grouping, ...) is
+actually tested — and the full-size architecture is checked tensor by
+tensor without weights. Real weights are compared for the checkpoints small
+enough to be in a test (SmolLM2-135M, Llama-3.2-1B, Qwen3-0.6B,
+Gemma-3-270m, Qwen3.5-0.8B: 2e-6 to 1e-5 of the logit scale in float32, on
+prompts of several hundred tokens). For the large and the gated
+checkpoints, `verify` is the check to run on the machine that holds them.
 
 ## Contributing
 
