@@ -1300,8 +1300,9 @@ class NN(nn.Module):
         """
             Split the network over `devices` as a pipeline: layers
             [0, b1) go to devices[0], [b1, b2) to devices[1], ..., and the
-            forward passes (and KnowledgeRowComputer) move the activation
-            across at each boundary. This is a model split for networks
+            forward passes (and KnowledgeRowComputer, KnowledgeMatrixComputer,
+            GradientMatrixComputer) move the activation across at each
+            boundary, never the network. This is a model split for networks
             that do not fit one GPU (e.g. a 24B-parameter LLM in bf16 with
             a long context); the inputs are still processed one at a time.
 

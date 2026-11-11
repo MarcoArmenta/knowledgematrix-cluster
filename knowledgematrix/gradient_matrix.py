@@ -44,6 +44,12 @@ class GradientMatrixComputer:
             device (Union[str, None]): Compute device; defaults to model.device.
             backend (str): "func" (torch.func.jacrev, default) or "autograd"
                 (chunked torch.autograd.grad) for the input Jacobian.
+
+        A network split over devices with `NN.shard` is supported by both
+        backends: it is left where it is (the input enters on its first
+        stage and autograd crosses the device boundaries with the forward
+        pass), and the matrix is returned on `device` (default: the first
+        stage), equal to that of the unsplit network.
     """
 
     def __init__(
@@ -85,15 +91,23 @@ class GradientMatrixComputer:
                 "Call model.eval() before computing the gradient knowledge matrix "
                 "(BatchNorm/Dropout must use eval-mode behaviour)."
             )
-        self.model.to(self.device)
-        x = x.to(self.device).reshape(self.input_shape)
+        if self.model.layer_devices is None:
+            self.model.to(self.device)
+            x = x.to(self.device).reshape(self.input_shape)
+        else:
+            # A network split over devices (NN.shard) is never moved: the
+            # input enters on its first stage and autograd follows the
+            # transfers of NN.forward. The Jacobian comes back on the
+            # input's device, the bias column on the output's; both are
+            # brought to `self.device` (no-ops for an unsplit network).
+            x = x.to(self.model.layer_devices[0]).reshape(self.input_shape)
         J = self._jacobian(x)
         self.current_output = self._forward_output(x)
         if extract_weff:
-            return J
+            return J.to(self.device)
         grad_x_input = J * x.flatten().unsqueeze(0)
         bias = self._bias_column(x)
-        return torch.cat((grad_x_input, bias.unsqueeze(1)), dim=1)
+        return torch.cat((grad_x_input.to(self.device), bias.to(self.device).unsqueeze(1)), dim=1)
 
     def _bias_tangents(self) -> dict:
         """
@@ -156,12 +170,14 @@ class GradientMatrixComputer:
         out = self.model.forward(x_leaf.reshape(self.input_shape)).flatten()
         n_out, n_in = out.numel(), x_leaf.numel()
         J = torch.empty((n_out, n_in), device=self.device, dtype=out.dtype)
-        eye = torch.eye(n_out, device=self.device, dtype=out.dtype)
+        # (the cotangents live with the output, the gradients with the
+        # input: different devices when the network is split)
+        eye = torch.eye(n_out, device=out.device, dtype=out.dtype)
         for start in range(0, n_out, self.batch_size):
             end = min(start + self.batch_size, n_out)
             grad = torch.autograd.grad(
                 out, x_leaf, grad_outputs=eye[start:end],
                 retain_graph=True, is_grads_batched=True
             )[0]
-            J[start:end] = grad
+            J[start:end] = grad.to(self.device)
         return J
