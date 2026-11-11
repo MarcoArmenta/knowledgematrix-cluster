@@ -61,9 +61,12 @@ class AlexNet(NN):
             if input_shape[0] != 3:
                 print(f"Warning: The pretrained model was trained on 3-channel images. The input shape is {input_shape}. The first layer won't have pretrained weights.")
                 self.layers[0] = nn.Conv2d(input_shape[0], 64, kernel_size=11, stride=4, padding=2)
-            elif num_classes != 1000:
-                print(f"Warning: The pretrained model was trained on 1000 classes. The number of classes is {num_classes}. The last layer won't have pretrained weights.")
-                self.layers[-1] = nn.Linear(4096, num_classes)
+            elif num_classes != self.layers[-1].out_features:
+                # (compared with the SOURCE's head, not with ImageNet's 1000:
+                # a fine-tuned source with num_classes outputs keeps its head)
+                head = self.layers[-1]
+                print(f"Warning: The pretrained model has {head.out_features} classes. The number of classes is {num_classes}. The last layer won't have pretrained weights.")
+                self.layers[-1] = nn.Linear(head.in_features, num_classes)
             if freeze_features:
                 self.freeze_features()
         else:

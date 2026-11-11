@@ -310,5 +310,72 @@ class TestOtherWrappers(unittest.TestCase):
         self._check(net, source, dropped=("AuxLogits.",))
 
 
+class TestSourceHeads(unittest.TestCase):
+    """
+        A source model that already has `num_classes` outputs -- a model
+        fine-tuned on another dataset -- keeps its trained head; the head
+        is replaced only when the class count differs. (Comparing
+        num_classes with ImageNet's 1000 instead replaced the trained
+        head of every fine-tuned source by a fresh random layer.)
+    """
+
+    #: wrapper name -> (wrapper class, input shape, torchvision builder, where the source keeps its head)
+    CASES = {
+        "resnet18": (ResNet18, (3, 8, 8), lambda n: torchvision.models.resnet18(weights=None, num_classes=n),
+                     lambda m: m.fc),
+        "resnet152": (ResNet152, (3, 8, 8), lambda n: torchvision.models.resnet152(weights=None, num_classes=n),
+                      lambda m: m.fc),
+        "alexnet": (AlexNet, (3, 64, 64), lambda n: torchvision.models.alexnet(weights=None, num_classes=n),
+                    lambda m: m.classifier[6]),
+        "vgg11": (VGG11, (3, 32, 32), lambda n: torchvision.models.vgg11(weights=None, num_classes=n),
+                  lambda m: m.classifier[6]),
+        "densenet121": (DenseNet, (3, 32, 32), lambda n: torchvision.models.densenet121(weights=None, num_classes=n),
+                        lambda m: m.classifier),
+        "googlenet": (GoogLeNet, (3, 32, 32),
+                      lambda n: torchvision.models.googlenet(weights=None, aux_logits=True, init_weights=False,
+                                                             num_classes=n),
+                      lambda m: m.fc),
+        "inception_v3": (Inception, (3, 75, 75),
+                         lambda n: torchvision.models.inception_v3(weights=None, aux_logits=True,
+                                                                   init_weights=False, num_classes=n),
+                         lambda m: m.fc),
+    }
+
+    def tearDown(self):
+        gc.collect()
+
+    def test_a_head_with_the_right_class_count_is_kept(self):
+        for name, (cls, shape, build, head_of) in self.CASES.items():
+            with self.subTest(wrapper=name):
+                torch.manual_seed(0)
+                source = build(10).eval()
+                head = head_of(source)
+                net = cls(input_shape=shape, num_classes=10, pretrained=True, pretrained_model=source)
+                last = net.layers[-1]
+                self.assertIsInstance(last, nn.Linear)
+                self.assertEqual(last.out_features, 10)
+                self.assertTrue(torch.equal(last.weight, head.weight), "the trained head was replaced")
+                self.assertTrue(torch.equal(last.bias, head.bias))
+
+    def test_a_head_with_another_class_count_is_replaced(self):
+        for name, (cls, shape, build, head_of) in self.CASES.items():
+            with self.subTest(wrapper=name):
+                torch.manual_seed(0)
+                source = build(10).eval()
+                head = head_of(source)
+                net = cls(input_shape=shape, num_classes=7, pretrained=True, pretrained_model=source)
+                last = net.layers[-1]
+                self.assertEqual((last.in_features, last.out_features), (head.in_features, 7))
+
+    def test_an_imagenet_head_is_kept_for_1000_classes(self):
+        for name in ("resnet152", "alexnet"):
+            cls, shape, build, head_of = self.CASES[name]
+            with self.subTest(wrapper=name):
+                torch.manual_seed(0)
+                source = build(1000).eval()
+                net = cls(input_shape=shape, num_classes=1000, pretrained=True, pretrained_model=source)
+                self.assertTrue(torch.equal(net.layers[-1].weight, head_of(source).weight))
+
+
 if __name__ == "__main__":
     unittest.main()

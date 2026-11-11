@@ -88,8 +88,10 @@ class Inception(NN):
             if input_shape[0] != 3:
                 print(f"Warning: The pretrained model was trained on 3-channel images. The input shape is {input_shape}. The first layer won't have pretrained weights.")
                 self.layers[0] = nn.Conv2d(input_shape[0], stem_out, kernel_size=3, stride=2, bias=False)
-            elif num_classes != 1000:
-                print(f"Warning: The pretrained model was trained on 1000 classes. The number of classes is {num_classes}. The last layer won't have pretrained weights.")
+            elif num_classes != self.layers[-1].out_features:
+                # (compared with the SOURCE's head, not with ImageNet's 1000:
+                # a fine-tuned source with num_classes outputs keeps its head)
+                print(f"Warning: The pretrained model has {self.layers[-1].out_features} classes. The number of classes is {num_classes}. The last layer won't have pretrained weights.")
                 self.layers[-1] = nn.Linear(classifier_in, num_classes)
         else:
             self._build_custom(input_shape[0], num_classes, scale)
