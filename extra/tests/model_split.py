@@ -11,7 +11,10 @@
     - `unshard` restores the single-device network;
     - the FULL matrix of a sharded network (KnowledgeMatrixComputer.forward
       and .segment, GradientMatrixComputer) equals the unsharded one, the
-      network is never moved, and the passes follow the device map.
+      network is never moved, and the passes follow the device map;
+    - the same for a network a checkpoint loader built already split
+      (`from_huggingface(..., device=[...])`), with the bias column alone
+      and the rows with the independent bias.
 
     The split is exercised over ["cpu", "cpu"] (the bookkeeping) and, when
     the machine has one, over ["cpu", "mps"] or ["cuda:0", "cuda:1"] (a real
@@ -490,6 +493,87 @@ class TestShardedConvNet(unittest.TestCase):
             self.skipTest("one device only")
         dtype = torch.float32 if "mps" in devices else torch.float64
         self._check(devices[::-1], dtype, 2e-4 if dtype == torch.float32 else 1e-9)
+
+
+### Networks that come out of a checkpoint loader already split ###
+
+try:
+    from transformers.models.llama import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+    from transformers.models.gemma2 import Gemma2Config
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+
+HF = dict(vocab_size=50, hidden_size=32, intermediate_size=64, num_hidden_layers=3,
+          num_attention_heads=4, num_key_value_heads=2, head_dim=8, max_position_embeddings=64)
+
+
+@unittest.skipUnless(HAS_TRANSFORMERS, "transformers is not installed")
+class TestLoaderShardedNetworks(unittest.TestCase):
+    """
+        `from_huggingface(..., device=[...])` places every tensor on the
+        device of its layer while loading (models/_hf.py), without going
+        through NN.shard. The matrix computers must treat such a network
+        like one split afterwards.
+    """
+
+    def _references(self, dtype):
+        torch.manual_seed(0)
+        with torch.device("cpu"):
+            # biases on the attention and MLP projections: a bias column
+            # that is not zero in frozen mode
+            llama = LlamaForCausalLM(LlamaConfig(**HF, attention_bias=True, mlp_bias=True)).to(dtype).eval()
+            # Gemma-2 soft-caps its logits: the network ends in a SoftCap
+            gemma = Gemma2ForCausalLM(Gemma2Config(**HF, sliding_window=4, attn_logit_softcapping=50.0,
+                                                   final_logit_softcapping=0.5,
+                                                   query_pre_attn_scalar=8)).to(dtype).eval()
+        return (("llama", LlamaLike, llama), ("gemma-2", GemmaLike, gemma))
+
+    def _check(self, devices, dtype, tol):
+        torch.manual_seed(1)
+        x = torch.randint(0, HF["vocab_size"], (1, 1, 5))
+        rows = [3, 2 * HF["vocab_size"] + 1, 4 * HF["vocab_size"] + 7]
+        for name, cls, hf in self._references(dtype):
+            for mode in ("frozen", "ratio"):
+                with self.subTest(model=name, devices=devices, mixer_mode=mode):
+                    whole = cls.from_huggingface(hf, dtype=dtype)
+                    self.assertIsNone(whole.layer_devices)
+                    comp = KnowledgeMatrixComputer(whole, batch_size=32, mixer_mode=mode)
+                    want = comp.forward(x)
+                    want_bias = comp.bias_column(x)
+                    want_rows = KnowledgeRowComputer(whole, mixer_mode=mode).forward(x, rows, independent_bias=True)
+
+                    split = cls.from_huggingface(hf, dtype=dtype, device=devices)
+                    assert_placed(self, split, devices)
+                    if name == "gemma-2":
+                        self.assertIsInstance(split.layers[-1], SoftCap)
+                    Spy(split)
+                    home = torch.device(devices[0]).type
+                    comp = KnowledgeMatrixComputer(split, batch_size=32, mixer_mode=mode)
+                    got = comp.forward(x.to(devices[0]))
+                    self.assertEqual(got.device.type, home)
+                    assert_close(self, got, want, tol, "matrix")
+                    out = comp.current_output.detach().reshape(-1)
+                    assert_close(self, got.sum(1), out, max(tol, 1e-10 if dtype == torch.float64 else 2e-4), "row sums")
+                    assert_close(self, comp.bias_column(x.to(devices[0])), want_bias, tol, "bias column")
+                    row_comp = KnowledgeRowComputer(split, mixer_mode=mode)
+                    got_rows = row_comp.forward(x.to(devices[0]), rows, independent_bias=True)
+                    assert_close(self, got_rows, want_rows, tol, "rows with the independent bias")
+                    assert_close(self, got_rows.sum(1), row_comp.row_outputs,
+                                 max(tol, 1e-10 if dtype == torch.float64 else 2e-4), "row sums of the rows")
+                    assert_placed(self, split, devices)
+
+    def test_cpu_cpu(self):
+        self._check(["cpu", "cpu"], torch.float64, 0)
+
+    def test_two_real_devices(self):
+        devices = second_device()
+        if devices is None:
+            self.skipTest("one device only")
+        dtype = torch.float32 if "mps" in devices else torch.float64
+        self._check(devices, dtype, 2e-4 if dtype == torch.float32 else 1e-9)
 
 
 if __name__ == "__main__":
