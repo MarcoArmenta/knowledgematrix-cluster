@@ -80,7 +80,11 @@ it tractable:
   whatever the input size. This is the efficient direction when a few
   outputs (the logits of some answer tokens) are studied over all inputs.
   `KnowledgeMatrixComputer(model).forward(x)` builds every column and is
-  for short prompts and small models.
+  for short prompts and small models. By default the last entry of a row
+  (the bias) is the remainder, output minus the rest;
+  `forward(x, rows, independent_bias=True)` computes it by its own pass
+  through the linearized network instead, which turns "the row sums to
+  the output" into a check of the row.
 * **Stopping before the head** — `load_llm(name, include_lm_head=False)`
   ends the network at the final norm (`T * hidden` rows). The head is a
   linear map, so the rows of any logit follow from these.
@@ -126,7 +130,7 @@ model = load_llm("meta-llama/Llama-3.3-70B-Instruct", dtype=torch.bfloat16,
   storage format, to be used when the model does not fit otherwise.
 * `device` may be a list: the network is then a pipeline over the devices,
   cut at block boundaries that balance the parameter count (`boundaries=`
-  to choose them; see `NN.shard`).
+  to choose them; see `NN.shard`). Both computers follow the pipeline.
 * The gated repositories (Llama, Gemma) need a hub token with access
   (`huggingface-cli login`, or `token=`).
 
@@ -154,8 +158,9 @@ python -m knowledgematrix.models.verify meta-llama/Llama-3.3-70B-Instruct \
 
 computes the logits with transformers, frees that model, loads the
 knowledge-matrix network and reports the gap between the two relative to
-the logit scale, the agreement on the top token, and the knowledge-matrix
-row sums. The two models are never in memory together.
+the logit scale, the agreement on the top token, and whether
+knowledge-matrix rows (with an independently computed bias) sum to their
+logits. The two models are never in memory together.
 
 What the test suite establishes, and what it cannot: for every checkpoint
 above, the real transformers class is instantiated on the published config
@@ -163,11 +168,25 @@ with only its sizes scaled down, and the network must reproduce it — with
 negative controls showing that each mechanism (RoPE base and rescaling,
 q/k normalization, sliding windows, soft-caps, head grouping, ...) is
 actually tested — and the full-size architecture is checked tensor by
-tensor without weights. Real weights are compared for the checkpoints small
-enough to be in a test (SmolLM2-135M, Llama-3.2-1B, Qwen3-0.6B,
-Gemma-3-270m, Qwen3.5-0.8B: 2e-6 to 1e-5 of the logit scale in float32, on
-prompts of several hundred tokens). For the large and the gated
-checkpoints, `verify` is the check to run on the machine that holds them.
+tensor without weights. Real weights can only be compared where the
+checkpoint is at hand. Measured with `verify` in float32 on a CPU:
+
+| Checkpoint | Tokens | Logit gap / logit scale | Same top token | Row-sum gap / row mass |
+|---|---|---|---|---|
+| SmolLM2-135M | 600 | 3.2e-6 | 100 % | 3.6e-7 |
+| Llama-3.2-1B | 600 | 2.1e-6 | 100 % | 1.8e-7 |
+| Llama-3.2-3B-Instruct | 256 | 4.6e-6 | 100 % | 2.8e-7 |
+| Qwen3-0.6B | 600 | 1.5e-5 | 100 % | 3.5e-7 |
+| Gemma-3-270m | 600 | 3.3e-6 | 100 % | 1.2e-7 |
+| Qwen3.5-0.8B | 300 | 1.6e-6 | 100 % | 1.4e-7 |
+| Qwen3.5-4B | 200 | 1.2e-5 | 100 % | 4.5e-7 |
+
+(For scale: transformers' own two attention implementations differ from
+each other by about 7e-6 on these models.) The other checkpoints —
+Llama-3.1-8B, Llama-3.3-70B, Qwen3-8B / 14B, Qwen3.5-27B, Gemma-2 and the
+larger Gemma-3 — share their code path with the ones above but have not
+been run with their own weights: `verify` is the check to run on the
+machine that holds them.
 
 ## Contributing
 
