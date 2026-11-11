@@ -12,11 +12,11 @@
     `load_llm` reads the checkpoint's config, picks the network class of
     its architecture family and streams the weights into it:
 
-        family     config.model_type                   class
-        ---------  ----------------------------------  ---------
-        llama      llama, mistral, qwen2, qwen3        LlamaLike
-        gemma      gemma2, gemma3, gemma3_text         GemmaLike
-        qwen3_5    qwen3_5, qwen3_5_text               Qwen3_5
+        family     config.model_type                       class
+        ---------  --------------------------------------  ---------
+        llama      llama, mistral, ministral, qwen2, qwen3  LlamaLike
+        gemma      gemma2, gemma3, gemma3_text              GemmaLike
+        qwen3_5    qwen3_5, qwen3_5_text                    Qwen3_5
 
     so any checkpoint of a supported architecture loads -- an instruct
     variant, a fine-tune, an ungated mirror -- not only the ones named in
@@ -50,10 +50,13 @@ class LLM:
 
 
 #: The checkpoints the library is tested against (their published
-#: config.json files are in extra/tests/fixtures/hf_configs).
+#: config.json files are in extra/tests/fixtures).
 SUPPORTED_LLMS: Dict[str, LLM] = {
     llm.repo: llm for llm in (
+        LLM("Qwen/Qwen3.5-0.8B", "qwen3_5"),
+        LLM("Qwen/Qwen3.5-2B", "qwen3_5"),
         LLM("Qwen/Qwen3.5-4B", "qwen3_5"),
+        LLM("Qwen/Qwen3.5-9B", "qwen3_5"),
         LLM("Qwen/Qwen3.5-27B", "qwen3_5"),
         LLM("google/gemma-2-2b", "gemma", gated=True),
         LLM("google/gemma-2-9b", "gemma", gated=True),
@@ -79,6 +82,7 @@ SUPPORTED_LLMS: Dict[str, LLM] = {
 FAMILIES: Dict[str, str] = {
     "llama": "llama",
     "mistral": "llama",
+    "ministral": "llama",
     "qwen2": "llama",
     "qwen3": "llama",
     "gemma2": "gemma",
@@ -234,6 +238,13 @@ def llm_footprint(
             given, "boundaries" (list[int]) and "per_device" (a list of
             {"device", "layers", "parameters", "gib"}).
 
+            "parameters" counts what the network STORES. A checkpoint
+            with tied embeddings needs its (vocab, hidden) table twice
+            when the LM head is included -- once as embedding, once as
+            head -- unless the loader shares one tensor between the two
+            (Qwen3.5, read from disk onto a single device), which is
+            accounted for.
+
         The figures are WEIGHTS only. A knowledge-matrix row costs about
         one forward and one backward pass on top (activations saved for
         every layer), which grows with the sequence length.
@@ -268,6 +279,11 @@ def llm_footprint(
     itemsize = torch.empty((), dtype=dtype).element_size()
     counts = [sum(p.numel() for p in layer.parameters()) for layer in net.layers]
     total = sum(counts)
+    pipeline = devices is not None and len(devices) > 1
+    tied = bool(getattr(config, "tie_word_embeddings", False))
+    if include_lm_head and tied and not pipeline and getattr(cls, "SHARES_TIED_HEAD", False):
+        # read from disk, one tensor serves as embedding and as head
+        total -= net.layers[0].weight.numel()
     report = {
         "class": cls.__name__,
         "num_layers": net.get_num_layers(),
@@ -275,7 +291,7 @@ def llm_footprint(
         "bytes": total * itemsize,
         "gib": total * itemsize / 2 ** 30,
     }
-    if devices is not None and len(devices) > 1:
+    if pipeline:
         layer_devices, cuts = net.shard_layout(list(devices), boundaries)
         edges = [0] + cuts + [len(counts)]
         report["boundaries"] = cuts

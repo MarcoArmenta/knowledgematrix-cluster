@@ -110,6 +110,13 @@ class Qwen3_5(NN):
     #: rmsnorm, swiglu, identity) -- the stride used when placing weights
     BLOCK_STRIDE = 6
 
+    #: A checkpoint with tied embeddings stores no LM head. Read from disk
+    #: onto a single device, the head of this network then reuses the
+    #: embedding tensor instead of holding a second (vocab, hidden) table
+    #: (see from_huggingface); llm_footprint reads this flag when it sizes
+    #: a checkpoint.
+    SHARES_TIED_HEAD = True
+
     def __init__(
             self,
             vocab_size: int = 248320,

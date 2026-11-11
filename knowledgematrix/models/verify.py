@@ -87,6 +87,11 @@ def _reference_logits(source, ids, dtype, device, hub_kwargs, reference_kwargs) 
     else:
         auto = AutoModelForCausalLM
     kwargs = dict(hub_kwargs)
+    if config.model_type.startswith("gemma"):
+        # transformers' default attention (sdpa) silently drops Gemma-2's
+        # attention soft-cap; only the eager implementation applies it,
+        # and that is the function the checkpoint was trained as.
+        kwargs["attn_implementation"] = "eager"
     kwargs.update(reference_kwargs or {})
     try:
         model = auto.from_pretrained(source, dtype=dtype, **kwargs)
@@ -107,6 +112,7 @@ def verify_llm(
         source: str,
         prompt: Optional[str] = None,
         tokens: Optional[int] = None,
+        input_ids: Optional[torch.Tensor] = None,
         dtype: torch.dtype = torch.float32,
         device: Union[str, Sequence[str]] = "cpu",
         rows: int = 4,
@@ -125,6 +131,8 @@ def verify_llm(
                 many tokens. Use a few hundred to exercise what only
                 shows at larger positions: RoPE frequency rescaling,
                 sliding windows, the chunked linear-attention recurrence.
+            input_ids (torch.Tensor | None): token ids of shape (1, T) to
+                use instead of tokenizing a prompt (no tokenizer needed).
             dtype: dtype of both models.
             device (str | list[str]): where the knowledge-matrix network
                 goes (a list = a pipeline over several devices).
@@ -152,7 +160,10 @@ def verify_llm(
     """
     source = resolve_llm(os.fspath(source))
     devices = [device] if isinstance(device, (str, torch.device)) else list(device)
-    ids = _token_ids(source, prompt, tokens, hub_kwargs)
+    if input_ids is not None:
+        ids = input_ids.reshape(1, -1)
+    else:
+        ids = _token_ids(source, prompt, tokens, hub_kwargs)
     T = ids.shape[1]
 
     start = time.time()
