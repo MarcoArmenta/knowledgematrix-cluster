@@ -408,20 +408,81 @@ class KnowledgeMatrixComputer:
             # Process bias and batch norm terms by iterating through layers again
             # Computing activation ratios and applying appropriate transformations
             if self.model._has_bias() or self.model._has_batchnorm() or self.model._has_layernorm() or self.model._has_groupnorm() or self.model._has_gated_product() or len(self.model.residuals) > 0:
-                a = torch.zeros(x.shape, device=in_device, dtype=dtype)
-                if len(x.shape) == 3:
-                    a = a.unsqueeze(0)
-                inputs_residuals = [None] * self.model.get_num_layers()
-                branch_snapshots = [None] * self.model.get_num_layers()
-                pstate = _ParallelState()
-                for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
-                    a = self._wire(a, i, inputs_residuals, branch_snapshots, pstate, affine=True)
-                    a = self._affine_step(a, i, layer)
-
+                a = self._bias_pass(x.shape, dtype)
                 a = a.reshape(-1, output_size)
                 return torch.cat((A, a.T.to(self.device)), dim=-1)
 
             return A
+
+    def _bias_pass(self, shape, dtype: torch.dtype) -> torch.Tensor:
+        """
+            The bias pass: the zero input pushed through the full AFFINE
+            linearized network (`_wire` + `_affine_step`), which leaves
+            exactly the constant term of the linearization -- the bias
+            column. One pass, no columns.
+
+            It reads the states saved by a reference pass (`model.save =
+            True`) at the input in question, which the caller must have
+            run; `shape` is the shape of the input after the start layers
+            (embedding, positional encoding) and `dtype` that of the
+            output. Runs under the caller's `torch.no_grad()`.
+
+            Returns:
+                torch.Tensor: the bias in the shape of the network output,
+                    on the device of the last layer.
+        """
+        model = self.model
+        start_layer = model._get_start_layer()
+        self._zero = torch.tensor(0.0, device=self.device, dtype=dtype)
+        self.IN_2D = (shape[-1] > 1)
+        a = torch.zeros(tuple(shape), device=self._layer_device(start_layer), dtype=dtype)
+        if len(shape) == 3:
+            a = a.unsqueeze(0)
+        inputs_residuals = [None] * model.get_num_layers()
+        branch_snapshots = [None] * model.get_num_layers()
+        pstate = _ParallelState()
+        for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+            a = self._wire(a, i, inputs_residuals, branch_snapshots, pstate, affine=True)
+            a = self._affine_step(a, i, layer)
+        return a
+
+    def bias_column(self, x: torch.Tensor) -> torch.Tensor:
+        """
+            The bias column of the knowledge matrix at x, alone: one
+            reference pass and one affine pass, whatever the input size --
+            none of the input columns is computed.
+
+            It is the last column of `forward(x)` whenever that has one
+            (same code, same arithmetic), under the same mixer_mode /
+            attention_mode, and all zeros for a network whose linearization
+            has no constant term. Being computed from the zero input, it
+            does not use the network output: with the input columns A of
+            the matrix, `A.sum(1) + bias_column(x) == f(x)` is an identity
+            that a wrong linearization breaks. KnowledgeRowComputer uses it
+            for its `independent_bias` option.
+
+            A network split over devices (`NN.shard`) is followed along its
+            device map, as in `forward`.
+
+            Args:
+                x (torch.Tensor): The input to the NN.
+            Returns:
+                torch.Tensor: The bias column, of shape (output_size,), on
+                    the computer's device. The network output of the same
+                    pass is in `current_output`.
+        """
+        with torch.no_grad():
+            model = self.model
+            model.save = True
+            if model.layer_devices is None:
+                model.to(self.device)
+            try:
+                self.current_output = model.forward(x)
+            finally:
+                model.save = False
+            # NN.forward recorded the shape of the input after the start layers
+            a = self._bias_pass((1, *model.input_shape), self.current_output.dtype)
+            return a.reshape(-1).to(self.device)
 
     def _check_cuts(self, start_cut: int, end_cut: int) -> None:
         """Raise unless (start_cut, end_cut) is a valid pair of segment cuts."""

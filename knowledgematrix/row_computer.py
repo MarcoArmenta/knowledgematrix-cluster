@@ -11,7 +11,7 @@ from knowledgematrix.neural_net import (
     GLU,
     _ParallelState,
 )
-from knowledgematrix.matrix_computer import _gated_product
+from knowledgematrix.matrix_computer import KnowledgeMatrixComputer, _gated_product
 
 
 class KnowledgeRowComputer:
@@ -32,6 +32,14 @@ class KnowledgeRowComputer:
 
         The rows agree exactly with the corresponding rows of
         KnowledgeMatrixComputer under the same mixer_mode.
+
+        By default the bias entry of a row is the remainder
+        `output - A.sum()`, so the row sums to the output by construction
+        and that sum checks nothing. `forward(..., independent_bias=True)`
+        returns instead the bias computed on its own, by one affine pass
+        from the zero input (`KnowledgeMatrixComputer.bias_column`): the
+        row then sums to the output only if the linearization is right,
+        and `row_outputs` holds the outputs to compare with.
 
         Scope: transformer-style models -- Embedding start layer, Linear,
         LayerNorm, RMSNorm, Identity, Dropout, Flatten, activation layers,
@@ -61,12 +69,16 @@ class KnowledgeRowComputer:
         self.model = model
         self.mixer_mode = mixer_mode
         self.device = device if device is not None else model.device
+        # Outputs of the network at the rows of the last `forward` call,
+        # shape (len(rows),), on `self.device`.
+        self.row_outputs: Union[torch.Tensor, None] = None
 
     def forward(
             self,
             x: torch.Tensor,
             rows: Sequence[int],
-            extract_weff: bool = False
+            extract_weff: bool = False,
+            independent_bias: bool = False
         ) -> torch.Tensor:
         """
             Computes the requested rows of the knowledge matrix of the
@@ -84,8 +96,22 @@ class KnowledgeRowComputer:
                     the knowledge matrix A with the bias entry appended,
                     of shape (len(rows), input_size + 1), so that each
                     row sums to the corresponding output coordinate.
+                independent_bias (bool): How the bias entry is obtained.
+                    False (default): as the remainder
+                    `output[row] - A[row].sum()` -- every row then sums to
+                    the output by construction, whatever A is.
+                    True: independently of the output, by one extra affine
+                    pass from the zero input through the linearized network
+                    (the bias column of KnowledgeMatrixComputer, same
+                    mixer_mode; no column is computed, so the cost is about
+                    one forward pass whatever the model size). The entry is
+                    then the actual bias of the row, and
+                    `rows.sum(1) == row_outputs` is a check that fails when
+                    the linearization is wrong. Ignored with extract_weff.
             Returns:
-                torch.Tensor: The requested rows.
+                torch.Tensor: The requested rows. The network outputs at
+                    those rows, from the same reference pass, are left in
+                    `self.row_outputs` (shape (len(rows),)).
         """
         model = self.model
         with torch.no_grad():
@@ -115,14 +141,35 @@ class KnowledgeRowComputer:
             weff_rows.append(grad.reshape(-1))
         W = torch.stack(weff_rows)  # (len(rows), input_size)
 
+        out_flat = out0.reshape(-1).to(self.device)
+        row_idx = torch.as_tensor(list(rows), device=self.device)
+        self.row_outputs = out_flat[row_idx]
+
         if extract_weff:
             return W
 
         A = W * e0.reshape(1, -1)
-        out_flat = out0.reshape(-1).to(self.device)
-        row_idx = torch.as_tensor(list(rows), device=self.device)
-        bias = out_flat[row_idx] - A.sum(dim=1)
+        if independent_bias:
+            bias = self._independent_bias(out0, row_idx)
+        else:
+            bias = out_flat[row_idx] - A.sum(dim=1)
         return torch.cat((A, bias.unsqueeze(1)), dim=1)
+
+    def _independent_bias(self, out0: torch.Tensor, row_idx: torch.Tensor) -> torch.Tensor:
+        """
+            The bias entries of the requested rows, computed without the
+            network output: the bias pass of KnowledgeMatrixComputer (one
+            affine pass from the zero input, through its `_wire` /
+            `_affine_step`) under this computer's mixer_mode, on the states
+            the reference pass of `forward` has just saved. It shares no
+            per-layer code with `_linear_forward`.
+        """
+        model = self.model
+        computer = KnowledgeMatrixComputer(model, device=self.device, mixer_mode=self.mixer_mode)
+        with torch.no_grad():
+            # (NN.forward recorded the shape of the embedded input)
+            bias = computer._bias_pass((1, *model.input_shape), out0.dtype).reshape(-1)
+            return bias[row_idx.to(bias.device)].to(self.device)
 
     def _linear_forward(self, e: torch.Tensor) -> torch.Tensor:
         """
