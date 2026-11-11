@@ -1,0 +1,19 @@
+config.json of the other dense Qwen3.5 checkpoints, fetched 2026-11-10 from
+https://huggingface.co/<repo>/resolve/main/config.json (file name = the
+repository, with "/" written "__"):
+
+  Qwen__Qwen3.5-0.8B.json, Qwen__Qwen3.5-2B.json, Qwen__Qwen3.5-9B.json
+
+They have the architecture of the Qwen3.5-4B / 27B in ../hf_configs and are
+used by extra/tests/qwen3_5.py alongside those two. They are kept apart
+because ../hf_configs holds exactly the checkpoints of
+knowledgematrix.models.hub.SUPPORTED_LLMS.
+
+The config.json of Qwen3.5-{0.8B,4B,9B}-Base was compared with that of the
+non-Base repository and is identical.
+
+Other Qwen3.5 repositories hold different networks, which the loader
+refuses. Checked on one repository of each kind: Qwen3.5-35B-A3B is a
+mixture-of-experts model (model_type qwen3_5_moe, text model_type
+qwen3_5_moe_text), Qwen3.5-27B-FP8 is quantized (quantization_config with
+quant_method fp8).
