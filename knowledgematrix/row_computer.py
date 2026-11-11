@@ -167,8 +167,10 @@ class KnowledgeRowComputer:
             network output: the bias pass of KnowledgeMatrixComputer (one
             affine pass from the zero input, through its `_wire` /
             `_affine_step`) under this computer's mixer_mode, on the states
-            the reference pass of `forward` has just saved. It shares no
-            per-layer code with `_linear_forward`.
+            the reference pass of `forward` has just saved. Its per-layer
+            dispatch is separate from `_linear_forward`; what the two share
+            is what they both linearize: the saved states, the weights, and
+            the layers' own `frozen_forward` (called here with the biases).
         """
         model = self.model
         computer = KnowledgeMatrixComputer(model, device=self.device, mixer_mode=self.mixer_mode)

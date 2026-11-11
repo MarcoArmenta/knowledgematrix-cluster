@@ -241,6 +241,25 @@ class TestBiasColumn(unittest.TestCase):
         self.assertEqual(bias.shape, (4,))
         self.assertEqual(bias.abs().max().item(), 0.0)
 
+    def test_an_elementwise_activation_with_a_value_at_zero(self):
+        # Sigmoid on an input coordinate that is exactly 0, in a network with
+        # no bias, norm, residual or mixing layer: sigmoid(0) = 1/2 has no
+        # post/pre ratio and is a constant of the linearization. Whether or
+        # not the matrix has a column for it, the bias pass yields it, and
+        # with the input columns it gives back the output.
+        net = NN(input_shape=(1, 1, 3))
+        net.sigmoid(); net.linear(3, 2, bias=False)
+        randomize(net, 12)
+        x = torch.tensor([[[0.3, 0.0, 2.0]]])
+        out = net(x).detach().reshape(-1)
+        comp = KnowledgeMatrixComputer(net, batch_size=4)
+        bias = comp.bias_column(x)
+        want = 0.5 * net.layers[1].weight[:, 1].detach()        # sigmoid(0) through the head
+        self.assertLess((bias - want).abs().max().item(), TOL)
+        self.assertGreater(bias.abs().max().item(), 1e-3)
+        columns = comp.forward(x)[:, :3]
+        self.assertLess((columns.sum(1) + bias - out).abs().max().item(), TOL)
+
     def test_it_costs_one_reference_pass_and_one_affine_pass(self):
         x = tokens()
         net = llama_with_biases()

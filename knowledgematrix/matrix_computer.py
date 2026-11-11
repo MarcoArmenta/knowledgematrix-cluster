@@ -458,11 +458,17 @@ class KnowledgeMatrixComputer:
             It is the last column of `forward(x)` whenever that has one
             (same code, same arithmetic), under the same mixer_mode /
             attention_mode, and all zeros for a network whose linearization
-            has no constant term. Being computed from the zero input, it
-            does not use the network output: with the input columns A of
-            the matrix, `A.sum(1) + bias_column(x) == f(x)` is an identity
-            that a wrong linearization breaks. KnowledgeRowComputer uses it
-            for its `independent_bias` option.
+            has no constant term. (The pass is run whether or not
+            `NN.has_bias_column()` holds, so it also returns the constant
+            that `forward` has no column for: an elementwise activation
+            with f(0) != 0 at a pre-activation of exactly 0, in a network
+            with no bias, norm, residual or mixing layer.)
+
+            Being computed from the zero input, it does not use the network
+            output: with the input columns A of the matrix,
+            `A.sum(1) + bias_column(x) == f(x)` is an identity that a wrong
+            linearization breaks. KnowledgeRowComputer uses it for its
+            `independent_bias` option.
 
             A network split over devices (`NN.shard`) is followed along its
             device map, as in `forward`.
