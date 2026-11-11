@@ -15,6 +15,11 @@
     memory is therefore one copy of the weights, which is what makes the
     check possible for the checkpoints that barely fit.
 
+    The row check uses KnowledgeRowComputer(independent_bias=True): the
+    bias entry of each row comes from its own pass through the linearized
+    network rather than from "output minus the rest", so a row that sums
+    to its logit is evidence, not a tautology.
+
     The test suite verifies every supported ARCHITECTURE against
     transformers with scaled-down random models; this tool is for the
     actual WEIGHTS, on the machine that can hold them (the gated and the
@@ -50,6 +55,17 @@ TOLERANCES = {
     torch.float32: 1e-3,
     torch.bfloat16: 1e-1,    # half precision is a storage format: loose by nature
     torch.float16: 1e-1,
+}
+
+#: pass threshold of the knowledge-matrix row check, on
+#: |row sum - output| relative to the absolute mass of the row. Healthy
+#: networks sit at 1e-16 (float64) and 5e-8 to 4e-6 (float32); a 1 % error
+#: in one layer's linear map reads 4e-4 or more. Half precision is too
+#: coarse for this check (3e-3 to 7e-2 on a healthy network), so there it
+#: is reported but not judged.
+ROW_TOLERANCES = {
+    torch.float64: 1e-9,
+    torch.float32: 1e-4,
 }
 
 DTYPES = {
@@ -153,10 +169,17 @@ def verify_llm(
               "argmax_agreement": fraction of positions with the same
                   top token,
               "row_sum_gap": max |sum of a knowledge-matrix row - its
-                  logit| (None when rows == 0), "row_sum_relative",
+                  logit| (None when rows == 0), with the bias entry of
+                  each row computed INDEPENDENTLY of the output (one
+                  affine pass from the zero input), so that this is a
+                  check that fails when the linearization is wrong;
+                  "row_sum_relative": the same gap relative to the
+                  absolute mass of the row, sum |entries| (the entries of
+                  a row can be far larger than the logit they add up to),
               "seconds_reference", "seconds_load", "seconds_rows",
-              "passed": relative_gap and row_sum_relative below
-                  TOLERANCES[dtype].
+              "passed": relative_gap below TOLERANCES[dtype] and
+                  row_sum_relative below ROW_TOLERANCES[dtype] (the rows
+                  are not judged in half precision).
     """
     source = resolve_llm(os.fspath(source))
     devices = [device] if isinstance(device, (str, torch.device)) else list(device)
@@ -203,20 +226,26 @@ def verify_llm(
         top = ours.reshape(T, vocab)[-1].topk(rows).indices.tolist()
         indices: List[int] = [(T - 1) * vocab + v for v in top]
         start = time.time()
-        A = KnowledgeRowComputer(net, mixer_mode=mixer_mode).forward(x, indices)
+        computer = KnowledgeRowComputer(net, mixer_mode=mixer_mode)
+        A = computer.forward(x, indices, independent_bias=True)
         report["seconds_rows"] = time.time() - start
-        sums = A.sum(dim=1).detach().to("cpu", torch.float64)
-        want = ours.reshape(-1)[indices]
-        report["row_sum_gap"] = (sums - want).abs().max().item()
-        report["row_sum_relative"] = report["row_sum_gap"] / scale
+        A = A.detach().to("cpu", torch.float64)
+        want = computer.row_outputs.detach().to("cpu", torch.float64)
+        gaps = (A.sum(dim=1) - want).abs()
+        report["row_sum_gap"] = gaps.max().item()
+        report["row_sum_relative"] = (gaps / A.abs().sum(dim=1)).max().item()
         report["rows"] = indices
 
     tolerance = TOLERANCES.get(dtype, 1e-3)
+    row_tolerance = ROW_TOLERANCES.get(dtype)
     report["tolerance"] = tolerance
-    report["passed"] = bool(
-        report["relative_gap"] < tolerance
-        and (report["row_sum_relative"] is None or report["row_sum_relative"] < tolerance)
+    report["row_tolerance"] = row_tolerance
+    rows_ok = (
+        report["row_sum_relative"] is None
+        or row_tolerance is None
+        or report["row_sum_relative"] < row_tolerance
     )
+    report["passed"] = bool(report["relative_gap"] < tolerance and rows_ok)
     del net
     _free()
     return report
@@ -231,15 +260,20 @@ def format_report(report: dict) -> str:
         f"  same top token         : {100 * report['argmax_agreement']:.1f}% of positions",
     ]
     if report["row_sum_gap"] is not None:
+        judged = "" if report["row_tolerance"] is not None else "; not judged in half precision"
         lines.append(
             f"  knowledge-matrix rows  : max |row sum - logit| {report['row_sum_gap']:.3e}  "
-            f"= {report['row_sum_relative']:.2e} of the logit scale ({len(report['rows'])} rows)"
+            f"= {report['row_sum_relative']:.2e} of the row's absolute mass "
+            f"({len(report['rows'])} rows, independent bias{judged})"
         )
     timing = f"  time                   : reference {report['seconds_reference']:.1f}s, load {report['seconds_load']:.1f}s"
     if report["seconds_rows"] is not None:
         timing += f", rows {report['seconds_rows']:.1f}s"
     lines.append(timing)
-    lines.append(f"  {'PASS' if report['passed'] else 'FAIL'} (tolerance {report['tolerance']:.0e} relative)")
+    verdict = f"  {'PASS' if report['passed'] else 'FAIL'} (logits within {report['tolerance']:.0e} of their scale"
+    if report["row_sum_gap"] is not None and report["row_tolerance"] is not None:
+        verdict += f", rows within {report['row_tolerance']:.0e} of their mass"
+    lines.append(verdict + ")")
     return "\n".join(lines)
 
 

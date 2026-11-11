@@ -419,6 +419,41 @@ class TestVerify(unittest.TestCase):
         self.assertGreater(report["relative_gap"], 1e-2)
         self.assertIn("FAIL", verify.format_report(report))
 
+    def test_fails_when_the_rows_are_not_the_linearization(self):
+        # the logits are right, one layer of the row pass is 1 % off: only
+        # an independently computed bias can notice
+        from knowledgematrix.models import verify
+        from knowledgematrix.row_computer import KnowledgeRowComputer
+        folder, ids = self._saved("HuggingFaceTB/SmolLM2-135M")
+        healthy = verify.verify_llm(folder, input_ids=ids, dtype=torch.float32, rows=3)
+        self.assertTrue(healthy["passed"])
+        self.assertLess(healthy["row_sum_relative"], 1e-5)
+
+        real_pass = KnowledgeRowComputer._linear_forward
+
+        def off_by_one_percent(self, e):
+            return 1.01 * real_pass(self, e)
+
+        KnowledgeRowComputer._linear_forward = off_by_one_percent
+        try:
+            broken = verify.verify_llm(folder, input_ids=ids, dtype=torch.float32, rows=3)
+        finally:
+            KnowledgeRowComputer._linear_forward = real_pass
+        self.assertLess(broken["relative_gap"], 1e-4)           # the logits still agree
+        self.assertGreater(broken["row_sum_relative"], verify.ROW_TOLERANCES[torch.float32])
+        self.assertFalse(broken["passed"])
+
+    def test_rows_are_reported_but_not_judged_in_half_precision(self):
+        from knowledgematrix.models import verify
+        self.assertNotIn(torch.bfloat16, verify.ROW_TOLERANCES)
+        self.assertNotIn(torch.float16, verify.ROW_TOLERANCES)
+        report = {"source": "x", "class": "LlamaLike", "dtype": "bfloat16", "tokens": 4, "logit_scale": 10.0,
+                  "max_abs_gap": 0.1, "relative_gap": 0.01, "worst_position": 0, "argmax_agreement": 1.0,
+                  "row_sum_gap": 0.5, "row_sum_relative": 0.05, "rows": [1, 2], "seconds_reference": 1.0,
+                  "seconds_load": 1.0, "seconds_rows": 1.0, "tolerance": 0.1, "row_tolerance": None,
+                  "passed": True}
+        self.assertIn("not judged in half precision", verify.format_report(report))
+
     def test_command_line(self):
         from knowledgematrix.models import verify
         folder, ids = self._saved("HuggingFaceTB/SmolLM2-135M")
