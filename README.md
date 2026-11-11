@@ -181,8 +181,10 @@ checkpoint is at hand. Measured with `verify` in float32 on a CPU:
 | Qwen3.5-0.8B | 300 | 1.6e-6 | 100 % | 1.4e-7 |
 | Qwen3.5-4B | 200 | 1.2e-5 | 100 % | 4.5e-7 |
 
-(For scale: transformers' own two attention implementations differ from
-each other by about 7e-6 on these models.) The other checkpoints —
+(The Llama and Gemma weights were read from the ungated `unsloth/`
+mirrors of the gated repositories. For scale: transformers' own two
+attention implementations differ from each other by about 7e-6 on these
+models.) The other checkpoints —
 Llama-3.1-8B, Llama-3.3-70B, Qwen3-8B / 14B, Qwen3.5-27B, Gemma-2 and the
 larger Gemma-3 — share their code path with the ones above but have not
 been run with their own weights: `verify` is the check to run on the
