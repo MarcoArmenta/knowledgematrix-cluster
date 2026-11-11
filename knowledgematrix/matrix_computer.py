@@ -99,6 +99,15 @@ class KnowledgeMatrixComputer:
                 linearizable layers are MultiHeadAttention (GPT2, GPTNeoX,
                 Transformer) the two give the same matrix. mixer_mode="frozen"
                 already includes it.
+
+        A network split over several devices with `NN.shard` is computed as
+        the pipeline it is: `forward` and `segment` never move it, the probe
+        batch and the bias pass go to the device of each layer in turn (the
+        saved states of the reference pass already live there), and only the
+        finished columns are brought to `device` -- which defaults to
+        `model.device`, the first stage -- where the returned matrix lives.
+        The matrix equals that of the unsplit network. `current_output` stays
+        where the forward pass leaves it (the device of the last layer).
     """
 
     def __init__(
@@ -157,12 +166,16 @@ class KnowledgeMatrixComputer:
         pass (affine=True). Inside segment(), the merges AT the segment's first
         index belong to the upstream segment and are skipped (seg_start)."""
         model = self.model
+        # A no-op unless the model is split over devices (NN.shard): the
+        # pass then moves to the device of layer i, exactly as NN.forward
+        # does, and finds there the states saved by the reference pass.
+        P = model.to_layer_device(P, i)
         if model.parallel_blocks:
             P = model.parallel_step(i, P, pstate, seg_start=seg_start)
         if i in model.residuals_starts or i in model.concat_skips_starts:
             inputs_residuals[i] = P
         if i in model.branch_inputs:
-            P = branch_snapshots[model.branch_inputs[i]]
+            P = model.to_layer_device(branch_snapshots[model.branch_inputs[i]], i)
         if i in model.residuals and i != seg_start:
             P = model.apply_residual(P, inputs_residuals, layer=i, affine=affine)
             if model.chained_residuals and i in model.residuals_starts:
@@ -172,6 +185,19 @@ class KnowledgeMatrixComputer:
         if i in model.branch_inputs_starts:
             branch_snapshots[i] = P
         return P
+
+    def _zero_for(self, t: torch.Tensor) -> torch.Tensor:
+        """The scalar 0 of the current pass on the device of `t`: `self._zero`
+        itself, except on the other stages of a network split over devices."""
+        zero = self._zero
+        return zero if zero.device == t.device else zero.to(t.device)
+
+    def _layer_device(self, i: int):
+        """The device layer i is applied on: its own for a network split
+        over devices (which is never moved), the computer's otherwise."""
+        if self.model.layer_devices is None:
+            return self.device
+        return self.model.layer_devices[i]
 
     def _linear_step(self, B: torch.Tensor, i: int, layer) -> torch.Tensor:
         """Probe-pass (weights-only) transform of layer i. Unknown layers
@@ -185,7 +211,7 @@ class KnowledgeMatrixComputer:
             vertices = post_act / pre_act
             vertices = torch.where(
                 torch.isnan(vertices) | torch.isinf(vertices),
-                self._zero,
+                self._zero_for(vertices),
                 vertices
             ).squeeze(0)  # Remove original batch dim
             B = B * vertices
@@ -200,7 +226,7 @@ class KnowledgeMatrixComputer:
             c = layer.act(torch.zeros((), dtype=u.dtype, device=u.device))
             M_u = (layer.gate_proj.weight @ B.transpose(-1, -2)).transpose(-1, -2)   # weight only
             ratio = (g - c) / u
-            ratio = torch.where(torch.isnan(ratio) | torch.isinf(ratio), self._zero, ratio)
+            ratio = torch.where(torch.isnan(ratio) | torch.isinf(ratio), self._zero_for(ratio), ratio)
             M_g = M_u * ratio
             M_v = (layer.value_proj.weight @ B.transpose(-1, -2)).transpose(-1, -2)  # weight only
             B = _gated_product(M_g, g, M_v, v, layer.alpha)
@@ -225,8 +251,8 @@ class KnowledgeMatrixComputer:
             B = B * (layer.weight.view(1, -1, 1, 1) / torch.sqrt(var_expanded + layer.eps))
         elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
             pool = self.model.maxpool_indices[i]
-            batch_indices = torch.arange(B.shape[0], device=self.device).view(-1,1,1,1)
-            channel_indices = torch.arange(pool.shape[1], device=self.device).view(1,-1,1,1)
+            batch_indices = torch.arange(B.shape[0], device=B.device).view(-1,1,1,1)
+            channel_indices = torch.arange(pool.shape[1], device=B.device).view(1,-1,1,1)
             row_indices = pool // B.shape[2] if self.IN_2D else pool
             col_indices = pool % B.shape[3]
             B = B[batch_indices, channel_indices, row_indices, col_indices]
@@ -241,9 +267,10 @@ class KnowledgeMatrixComputer:
             post_act = self.model.acts[i]
             vertices = post_act / pre_act
             undefined = torch.isnan(vertices) | torch.isinf(vertices)
+            zero = self._zero_for(vertices)
             vertices = torch.where(
                 undefined,
-                self._zero,
+                zero,
                 vertices
             )
             a = a * vertices
@@ -257,7 +284,7 @@ class KnowledgeMatrixComputer:
             # (attention, gated MLP) fed by a norm whose scale is
             # exactly 0 in some coordinate -- which trained
             # checkpoints do contain (Gemma-3).
-            a = a + torch.where(undefined & torch.isfinite(post_act), post_act, self._zero)
+            a = a + torch.where(undefined & torch.isfinite(post_act), post_act, zero)
         elif isinstance(layer, GLU):
             u, g, v = self.model.gated_products[i]
             u = u.squeeze(0); g = g.squeeze(0); v = v.squeeze(0)
@@ -267,7 +294,7 @@ class KnowledgeMatrixComputer:
             c = layer.act(torch.zeros((), dtype=u.dtype, device=u.device))
             M_u = layer.gate_proj(a)     # full linear: W1·a + b1
             ratio = (g - c) / u
-            ratio = torch.where(torch.isnan(ratio) | torch.isinf(ratio), self._zero, ratio)
+            ratio = torch.where(torch.isnan(ratio) | torch.isinf(ratio), self._zero_for(ratio), ratio)
             M_g = M_u * ratio + c
             M_v = layer.value_proj(a)    # W2·a + b2
             a = _gated_product(M_g, g, M_v, v, layer.alpha)
@@ -283,8 +310,8 @@ class KnowledgeMatrixComputer:
             a = ((a - mean_expanded) / torch.sqrt(var_expanded + layer.eps)) * layer.weight.view(1, -1, 1, 1) + layer.bias.view(1, -1, 1, 1)
         elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveMaxPool2d)):
             pool = self.model.maxpool_indices[i]
-            batch_indices = torch.arange(pool.shape[0], device=self.device).view(-1,1,1,1)
-            channel_indices = torch.arange(pool.shape[1], device=self.device).view(1,-1,1,1)
+            batch_indices = torch.arange(pool.shape[0], device=a.device).view(-1,1,1,1)
+            channel_indices = torch.arange(pool.shape[1], device=a.device).view(1,-1,1,1)
             row_indices = pool // a.shape[2] if self.IN_2D else pool
             col_indices = pool % a.shape[3]
             a = a[batch_indices, channel_indices, row_indices, col_indices]
@@ -311,12 +338,15 @@ class KnowledgeMatrixComputer:
         with torch.no_grad():
             # Saves activations and pre-activations
             self.model.save = True
-            self.model.to(self.device)
+            if self.model.layer_devices is None:
+                self.model.to(self.device)
+            # (a network split over devices stays where `NN.shard` put it:
+            # moving it would collapse the split)
             self.current_output = self.model.forward(x)
             self.model.save = False
             start_layer = self.model._get_start_layer()
-            for layer in self.model.layers[:start_layer]:
-                x = layer(x)
+            for i, layer in enumerate(self.model.layers[:start_layer]):
+                x = layer(self.model.to_layer_device(x, i))
             if start_layer > 0:
                 C, H, W = x.shape[1], x.shape[2], x.shape[3]
             else:
@@ -330,7 +360,11 @@ class KnowledgeMatrixComputer:
 
             self.IN_2D = (W > 1)  # Wether the input is of shape (C,H,W) or (C,L,1)
 
-            x = x.to(self.device)
+            # The probe batch starts on the device of the first layer it
+            # goes through (the computer's own device unless the network is
+            # split) and follows the layers from there, see `_wire`.
+            in_device = self._layer_device(start_layer)
+            x = x.to(in_device)
             self._zero = torch.tensor(0.0, device=self.device, dtype=dtype)
             inputs_residuals = [None] * self.model.get_num_layers()
             branch_snapshots = [None] * self.model.get_num_layers()
@@ -343,18 +377,18 @@ class KnowledgeMatrixComputer:
                 current_batch_size = end - start
 
                 # Create indices for this batch
-                indices = torch.arange(start, end, device=self.device)
+                indices = torch.arange(start, end, device=in_device)
                 c = indices // (H*W)
                 remaining = indices % (H*W)
                 h = remaining // W
                 w = remaining % W
 
                 # Create batched input for this chunk
-                batched_input = torch.zeros((current_batch_size,C,H,W), device=self.device, dtype=dtype)
+                batched_input = torch.zeros((current_batch_size,C,H,W), device=in_device, dtype=dtype)
                 if extract_weff:
-                    batched_input[torch.arange(current_batch_size, device=self.device),c,h,w] = 1.0
+                    batched_input[torch.arange(current_batch_size, device=in_device),c,h,w] = 1.0
                 else:
-                    batched_input[torch.arange(current_batch_size, device=self.device),c,h,w] = x.flatten()[start:end]
+                    batched_input[torch.arange(current_batch_size, device=in_device),c,h,w] = x.flatten()[start:end]
 
                 B = batched_input
                 pstate = _ParallelState()
@@ -366,28 +400,98 @@ class KnowledgeMatrixComputer:
                     B = self._linear_step(B, i, layer)
 
                 B = B.reshape(-1, output_size)
-                A[:, start:end] = B.T
+                A[:, start:end] = B.T.to(self.device)   # from the last stage of a split network
 
             if extract_weff:
                 return A
 
             # Process bias and batch norm terms by iterating through layers again
             # Computing activation ratios and applying appropriate transformations
-            if self.model._has_bias() or self.model._has_batchnorm() or self.model._has_layernorm() or self.model._has_groupnorm() or self.model._has_gated_product() or len(self.model.residuals) > 0:
-                a = torch.zeros(x.shape, device=self.device, dtype=dtype)
-                if len(x.shape) == 3:
-                    a = a.unsqueeze(0)
-                inputs_residuals = [None] * self.model.get_num_layers()
-                branch_snapshots = [None] * self.model.get_num_layers()
-                pstate = _ParallelState()
-                for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
-                    a = self._wire(a, i, inputs_residuals, branch_snapshots, pstate, affine=True)
-                    a = self._affine_step(a, i, layer)
-
+            # (one condition for this method and NN.get_matrix_shape: any
+            # source of a constant term, biases inside composite layers and
+            # the mixing layers themselves included)
+            if self.model.has_bias_column():
+                a = self._bias_pass(x.shape, dtype)
                 a = a.reshape(-1, output_size)
-                return torch.cat((A, a.T), dim=-1)
+                return torch.cat((A, a.T.to(self.device)), dim=-1)
 
             return A
+
+    def _bias_pass(self, shape, dtype: torch.dtype) -> torch.Tensor:
+        """
+            The bias pass: the zero input pushed through the full AFFINE
+            linearized network (`_wire` + `_affine_step`), which leaves
+            exactly the constant term of the linearization -- the bias
+            column. One pass, no columns.
+
+            It reads the states saved by a reference pass (`model.save =
+            True`) at the input in question, which the caller must have
+            run; `shape` is the shape of the input after the start layers
+            (embedding, positional encoding) and `dtype` that of the
+            output. Runs under the caller's `torch.no_grad()`.
+
+            Returns:
+                torch.Tensor: the bias in the shape of the network output,
+                    on the device of the last layer.
+        """
+        model = self.model
+        start_layer = model._get_start_layer()
+        self._zero = torch.tensor(0.0, device=self.device, dtype=dtype)
+        self.IN_2D = (shape[-1] > 1)
+        a = torch.zeros(tuple(shape), device=self._layer_device(start_layer), dtype=dtype)
+        if len(shape) == 3:
+            a = a.unsqueeze(0)
+        inputs_residuals = [None] * model.get_num_layers()
+        branch_snapshots = [None] * model.get_num_layers()
+        pstate = _ParallelState()
+        for i, layer in enumerate(self.layers[start_layer:], start=start_layer):
+            a = self._wire(a, i, inputs_residuals, branch_snapshots, pstate, affine=True)
+            a = self._affine_step(a, i, layer)
+        return a
+
+    def bias_column(self, x: torch.Tensor) -> torch.Tensor:
+        """
+            The bias column of the knowledge matrix at x, alone: one
+            reference pass and one affine pass, whatever the input size --
+            none of the input columns is computed.
+
+            It is the last column of `forward(x)` whenever that has one
+            (same code, same arithmetic), under the same mixer_mode /
+            attention_mode, and all zeros for a network whose linearization
+            has no constant term. (The pass is run whether or not
+            `NN.has_bias_column()` holds, so it also returns the constant
+            that `forward` has no column for: an elementwise activation
+            with f(0) != 0 at a pre-activation of exactly 0, in a network
+            with no bias, norm, residual or mixing layer.)
+
+            Being computed from the zero input, it does not use the network
+            output: with the input columns A of the matrix,
+            `A.sum(1) + bias_column(x) == f(x)` is an identity that a wrong
+            linearization breaks. KnowledgeRowComputer uses it for its
+            `independent_bias` option.
+
+            A network split over devices (`NN.shard`) is followed along its
+            device map, as in `forward`.
+
+            Args:
+                x (torch.Tensor): The input to the NN.
+            Returns:
+                torch.Tensor: The bias column, of shape (output_size,), on
+                    the computer's device. The network output of the same
+                    pass is in `current_output`.
+        """
+        with torch.no_grad():
+            model = self.model
+            model.save = True
+            if model.layer_devices is None:
+                model.to(self.device)
+            try:
+                self.current_output = model.forward(x)
+            finally:
+                model.save = False
+            # NN.forward recorded the shape of the input after the start layers
+            a = self._bias_pass((1, *model.input_shape), self.current_output.dtype)
+            return a.reshape(-1).to(self.device)
 
     def _check_cuts(self, start_cut: int, end_cut: int) -> None:
         """Raise unless (start_cut, end_cut) is a valid pair of segment cuts."""
@@ -435,7 +539,9 @@ class KnowledgeMatrixComputer:
         with torch.no_grad():
             # Reference pass: activations, patterns, LN stats, stream values
             save_stream = self.model.save_stream
-            self.model.to(self.device)
+            if self.model.layer_devices is None:
+                self.model.to(self.device)
+            # (a network split over devices is never moved, see forward)
             self.model.save = True
             self.model.save_stream = True
             try:
@@ -444,7 +550,10 @@ class KnowledgeMatrixComputer:
                 self.model.save = False
                 self.model.save_stream = save_stream
 
-            x0 = self.model.stream[start_cut].to(self.device)      # (1, C, T, D)
+            # The cut value lives on the device of layer start_cut, where
+            # the probe batch of the segment starts.
+            in_device = self._layer_device(start_cut)
+            x0 = self.model.stream[start_cut].to(in_device)        # (1, C, T, D)
             seg_out = self.current_output if end_cut == n else self.model.stream[end_cut]
             dtype = self.current_output.dtype
             self._zero = torch.tensor(0.0, device=self.device, dtype=dtype)
@@ -472,7 +581,10 @@ class KnowledgeMatrixComputer:
                     P = self._wire(P, i, inputs_residuals, branch_snapshots, pstate,
                                    affine=affine, seg_start=start_cut)
                     P = step(P, i, layer)
-                # Trailing step: the merges AT end_cut close this segment.
+                # Trailing step: the merges AT end_cut close this segment
+                # (on the device of layer end_cut, where NN.forward does them).
+                if end_cut < n:
+                    P = self.model.to_layer_device(P, end_cut)
                 if end_cut < n and end_cut in self.model.parallel_blocks:
                     P = pstate.saved.pop(end_cut) + pstate.branch1.pop(end_cut) + P
                 if end_cut < n and end_cut in self.model.residuals:
@@ -483,17 +595,17 @@ class KnowledgeMatrixComputer:
                 start = batch * self.batch_size
                 end = min((batch + 1) * self.batch_size, total_positions)
                 cbs = end - start
-                indices = torch.arange(start, end, device=self.device)
+                indices = torch.arange(start, end, device=in_device)
                 c = indices // (H * W)
                 remaining = indices % (H * W)
                 h = remaining // W
                 w = remaining % W
-                B = torch.zeros((cbs, C, H, W), device=self.device, dtype=dtype)
-                B[torch.arange(cbs, device=self.device), c, h, w] = x0.flatten()[start:end]
+                B = torch.zeros((cbs, C, H, W), device=in_device, dtype=dtype)
+                B[torch.arange(cbs, device=in_device), c, h, w] = x0.flatten()[start:end]
                 B = run_probe(B, affine=False)
-                A[:, start:end] = B.reshape(cbs, -1)[:, row_lo:row_hi].T
+                A[:, start:end] = B.reshape(cbs, -1)[:, row_lo:row_hi].T.to(self.device)
 
-            a = torch.zeros(x0.shape, device=self.device, dtype=dtype)
+            a = torch.zeros(x0.shape, device=in_device, dtype=dtype)
             a = run_probe(a, affine=True)
             a = a.reshape(1, -1)[:, row_lo:row_hi]
-            return torch.cat((A, a.T), dim=-1)
+            return torch.cat((A, a.T.to(self.device)), dim=-1)

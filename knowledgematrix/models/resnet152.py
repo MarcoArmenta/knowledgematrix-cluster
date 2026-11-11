@@ -146,10 +146,30 @@ class ResNet152(NN):
         end_skip = self.get_num_layers()
         self.residual(start_skip, end_skip)
         if bottleneck.downsample is not None:
-            # Override the auto-generated projection with torchvision's actual
-            # downsample modules so the pretrained weights are used.
-            for i, downsample_layer in enumerate(bottleneck.downsample.children()):
-                self.residuals[end_skip][0][1][i] = downsample_layer
+            # Replace the auto-generated projection with torchvision's actual
+            # downsample modules so the pretrained weights are used -- and
+            # REGISTER them (same fix as in ``resnet18.py``). ``NN.residual``
+            # registers only the projection it creates; modules swapped into
+            # the wiring by index stay outside ``parameters()`` /
+            # ``buffers()`` / ``modules()`` / ``state_dict()`` / ``to()``,
+            # while the discarded projection stays registered in their place.
+            # The forward pass does not notice, but ``.to(device)`` leaves the
+            # real projections behind, ``state_dict()`` saves the wrong ones,
+            # and ``GradientMatrixComputer``'s bias column (a parameter-space
+            # JVP over ``named_parameters()``) misses the downsample BNs'
+            # effective bias ``beta - gamma*mu/sigma`` (row-sum residual 6.35
+            # relative on the IMAGENET1K_V2 weights, 0.19 to 0.22 with random
+            # BN statistics; exactly 0 at a fresh init where mu = beta = 0, so
+            # init-only tests pass).
+            for stale in self.residuals[end_skip][0][1]:
+                if not isinstance(stale, nn.Identity):
+                    del self.residual_modules[
+                        next(k for k, m in enumerate(self.residual_modules) if m is stale)
+                    ]
+            real_proj = list(bottleneck.downsample.children())
+            self.residuals[end_skip][0] = (start_skip, real_proj)
+            for downsample_layer in real_proj:
+                self.residual_modules.append(downsample_layer)
         # Freeze running stats on every BN inside the residual projection so
         # subsequent shape_at_layer() calls don't corrupt them.
         for _, proj in self.residuals[end_skip]:

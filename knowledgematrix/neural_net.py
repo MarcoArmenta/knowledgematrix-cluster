@@ -1192,16 +1192,62 @@ class NN(nn.Module):
 
     def get_matrix_shape(self) -> Tuple[int]:
         # Returns the shape of the knowledge matrix in the format: (rows, columns).
-        return (self.layers[-1].out_features, self.get_input_size() + int(self._has_bias() or self._has_batchnorm() or self._has_layernorm() or self._has_groupnorm() or self._has_gated_product()))
-    
+        # The bias column is there under the very condition that makes
+        # KnowledgeMatrixComputer.forward compute it (has_bias_column).
+        return (self.layers[-1].out_features, self.get_input_size() + int(self.has_bias_column()))
+
+    def has_bias_column(self) -> bool:
+        """
+            Whether the knowledge matrix of this network has a bias column
+            (input_size + 1 columns), i.e. whether its linearization can
+            have a constant term. This is the one condition used both by
+            KnowledgeMatrixComputer.forward, which runs the bias pass iff
+            it holds, and by `get_matrix_shape`, so the two cannot
+            disagree. It depends on the network only -- not on the input,
+            nor on the mixer_mode -- so the shape of the matrix is known
+            beforehand; the column is then simply zero where the
+            linearization at hand has no constant.
+
+            The sources of a constant term:
+            - a bias parameter anywhere (`_has_bias`),
+            - BatchNorm / LayerNorm / GroupNorm (statistics and shifts),
+            - a GLU with projection biases or act(0) != 0,
+            - a token-mixing / gated layer (`_has_mixer`),
+            - residual connections (their projections).
+        """
+        return (self._has_bias() or self._has_batchnorm() or self._has_layernorm()
+                or self._has_groupnorm() or self._has_gated_product()
+                or self._has_mixer() or len(self.residuals) > 0)
+
     def _has_bias(self) -> bool:
-        for layer in self.layers:
-            try: 
-                _ = layer.bias.data
-                return True
-            except:
-                continue
+        # A bias parameter that takes part in the linearization: on a layer
+        # itself (Linear, Conv, the norms), on a projection INSIDE a
+        # composite layer (SwiGLU / GeGLU up and down projections, the
+        # value and output projections of RopeAttention / GatedAttention /
+        # MultiHeadAttention, a GLU), or in a residual projection. Looking
+        # only at `layer.bias` misses the composite layers: with
+        # mixer_mode="frozen" their biases are constants of the frozen map,
+        # and without the bias pass the rows no longer sum to the output.
+        modules = list(self.layers)
+        for pairs in self.residuals.values():
+            for _, projection in pairs:
+                modules.extend(projection)
+        for module in modules:
+            for submodule in module.modules():
+                if isinstance(getattr(submodule, "bias", None), torch.Tensor):
+                    return True
         return False
+
+    def _has_mixer(self) -> bool:
+        # A token-mixing / gated layer (attention, gated MLP, DeltaNet).
+        # Under the elementwise post/pre ratio it is an activation whose
+        # output at a coordinate does not vanish with its input there (it
+        # mixes coordinates, and may have biases): where the input is
+        # exactly 0 the ratio does not exist and the output is a constant
+        # of the linearization, which only the bias pass can carry (see
+        # KnowledgeMatrixComputer._affine_step). So such a network always
+        # has the bias column, with or without bias parameters.
+        return any(isinstance(layer, LINEARIZABLE_LAYERS) for layer in self.layers)
 
     def _has_batchnorm(self) -> bool:
         for layer in self.layers:
@@ -1300,8 +1346,9 @@ class NN(nn.Module):
         """
             Split the network over `devices` as a pipeline: layers
             [0, b1) go to devices[0], [b1, b2) to devices[1], ..., and the
-            forward passes (and KnowledgeRowComputer) move the activation
-            across at each boundary. This is a model split for networks
+            forward passes (and KnowledgeRowComputer, KnowledgeMatrixComputer,
+            GradientMatrixComputer) move the activation across at each
+            boundary, never the network. This is a model split for networks
             that do not fit one GPU (e.g. a 24B-parameter LLM in bf16 with
             a long context); the inputs are still processed one at a time.
 
