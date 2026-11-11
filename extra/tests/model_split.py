@@ -19,7 +19,9 @@ import unittest
 
 import torch
 
+from knowledgematrix.neural_net import SoftCap
 from knowledgematrix.models.llama import LlamaLike
+from knowledgematrix.models.gemma import GemmaLike
 from knowledgematrix.models.qwen3_5 import Qwen3_5
 from knowledgematrix.row_computer import KnowledgeRowComputer
 
@@ -30,6 +32,12 @@ QWEN = dict(vocab_size=50, hidden_size=24, intermediate_size=48,
             num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
             head_dim=8, linear_num_value_heads=4, linear_num_key_heads=2,
             linear_key_head_dim=6, linear_value_head_dim=6)
+# Gemma-2 with its logit soft-cap: the network ENDS in a SoftCap layer, which
+# has no parameter (the cap is small so that it bites on the tiny logits of
+# a randomly initialized model).
+GEMMA2 = dict(vocab_size=50, hidden_size=24, intermediate_size=48,
+              num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
+              head_dim=6, attn_softcap=30.0, sliding_window=4, final_softcap=0.25)
 
 
 def second_device():
@@ -56,6 +64,25 @@ def build(cls, params, dtype, seed=0):
 def rows_of(net, x, rows, mode):
     comp = KnowledgeRowComputer(net, mixer_mode=mode)
     return comp.forward(x, rows).detach().cpu()
+
+
+def assert_placed(test, net, devices):
+    """
+        Every parameter and buffer of every layer, and of the residual
+        projections applied at a layer, sits on the device `layer_devices`
+        says. Layers without storage (Identity, SoftCap, activations) have
+        nothing to check, so the last layer of the network may be one.
+    """
+    test.assertEqual(len(net.layer_devices), net.get_num_layers())
+    test.assertEqual(net.layer_devices[0], devices[0])
+    test.assertEqual(net.layer_devices[-1], devices[-1])
+    test.assertEqual(set(net.layer_devices), set(devices))
+    for i, layer in enumerate(net.layers):
+        want = torch.device(net.layer_devices[i]).type
+        modules = [layer] + [m for _, proj in net.residuals.get(i, []) for m in proj]
+        for module in modules:
+            for t in list(module.parameters()) + list(module.buffers()):
+                test.assertEqual(t.device.type, want, f"layer {i} ({type(layer).__name__})")
 
 
 class TestCutPoints(unittest.TestCase):
@@ -111,12 +138,10 @@ class TestShardedEqualsUnsharded(unittest.TestCase):
 
         net = build(cls, params, dtype).shard(devices)
         self.assertEqual(net.device, devices[0])
-        self.assertEqual(set(net.layer_devices), set(devices))
-        # the first stage really is on devices[0], the last on devices[-1]
-        self.assertEqual(next(net.layers[0].parameters()).device.type,
-                         torch.device(devices[0]).type)
-        self.assertEqual(next(net.layers[-1].parameters()).device.type,
-                         torch.device(devices[-1]).type)
+        # every layer really is on its stage's device (the first stage on
+        # devices[0], the last on devices[-1]); the last layer itself may
+        # have no parameter at all
+        assert_placed(self, net, devices)
 
         out = net(x.to(devices[0])).detach().cpu()
         self.assertTrue(torch.allclose(out, out_ref, atol=tol, rtol=0),
@@ -155,6 +180,29 @@ class TestShardedEqualsUnsharded(unittest.TestCase):
         dtype = torch.float32 if "mps" in devices else torch.float64
         tol = 2e-4 if dtype == torch.float32 else 1e-9
         self._check(Qwen3_5, QWEN, devices, dtype, tol)
+
+    def test_gemma2_ends_in_a_parameter_free_layer(self):
+        net = build(GemmaLike, GEMMA2, torch.float64)
+        self.assertIsInstance(net.layers[-1], SoftCap)
+        self.assertEqual(len(list(net.layers[-1].parameters())), 0)
+        # the cap does change the logits of this network
+        x = torch.randint(0, GEMMA2["vocab_size"], (1, 1, 7))
+        uncapped = build(GemmaLike, dict(GEMMA2, final_softcap=None), torch.float64)
+        self.assertGreater((net(x) - uncapped(x)).abs().max().item(), 1e-3)
+
+    def test_gemma2_with_cap_cpu_cpu(self):
+        self._check(GemmaLike, GEMMA2, ["cpu", "cpu"], torch.float64, 1e-12)
+
+    def test_gemma2_with_cap_cpu_cpu_cpu(self):
+        self._check(GemmaLike, GEMMA2, ["cpu", "cpu", "cpu"], torch.float64, 1e-12)
+
+    def test_gemma2_with_cap_two_real_devices(self):
+        devices = second_device()
+        if devices is None:
+            self.skipTest("one device only")
+        dtype = torch.float32 if "mps" in devices else torch.float64
+        tol = 2e-4 if dtype == torch.float32 else 1e-9
+        self._check(GemmaLike, GEMMA2, devices, dtype, tol)
 
 
 if __name__ == "__main__":
