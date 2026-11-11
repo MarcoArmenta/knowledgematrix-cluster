@@ -413,6 +413,9 @@ class NN(nn.Module):
     def tanh(self) -> None:
         self.layers.append(nn.Tanh())
 
+    def softcap(self, cap: float) -> None:
+        self.layers.append(SoftCap(cap=cap))
+
     def celu(self, alpha: float = 1.0) -> None:
         self.layers.append(nn.CELU(alpha=alpha))
 
@@ -2268,6 +2271,38 @@ class GatedDeltaNet(nn.Module):
         return self.out_proj(core)
 
 
+class SoftCap(nn.Module):
+    """
+        Elementwise tanh soft-capping, x -> cap * tanh(x / cap): the
+        identity to first order near 0, saturating at +-cap. Gemma-2
+        applies it to its final logits (final_logit_softcapping = 30), so
+        a network that is to reproduce the logits of the reference
+        implementation ends with this layer, after the LM head.
+
+        It is an activation in the sense of the knowledge matrix: an
+        elementwise function, linearized by the post/pre ratio
+        cap * tanh(x / cap) / x (a diagonal map) in every mode -- there is
+        no routing to freeze, so "ratio" and "frozen" treat it alike, and
+        the rows of the matrix sum to the CAPPED outputs.
+
+        Args:
+            cap (float): The saturation value (> 0).
+    """
+    def __init__(self, cap: float) -> None:
+        super().__init__()
+        cap = float(cap)
+        if not cap > 0:
+            raise ValueError(f"cap must be positive, got {cap}.")
+        self.cap = cap
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # same operation order as the reference (divide, tanh, multiply)
+        return torch.tanh(x / self.cap) * self.cap
+
+    def extra_repr(self) -> str:
+        return f"cap={self.cap}"
+
+
 class JumpReLU(nn.ReLU):
     """
         JumpReLU activation: z * 1[z > threshold], with per-feature thresholds.
@@ -2452,6 +2487,7 @@ ACTIVATION_LAYERS = (
     nn.Mish, nn.Softmax, nn.CELU, nn.Hardsigmoid, nn.Hardswish, nn.PReLU,
     nn.ReLU6, nn.Softplus, MultiHeadAttention, GatedAttention, GatedDeltaNet,
     SwiGLU, GeGLU, RopeAttention,
+    SoftCap,
 )
 
 # Layers that additionally support the frozen-routing linearization
