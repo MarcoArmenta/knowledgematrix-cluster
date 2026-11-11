@@ -349,7 +349,28 @@ class KnowledgeMatrixComputer:
                 x = layer(self.model.to_layer_device(x, i))
             if start_layer > 0:
                 C, H, W = x.shape[1], x.shape[2], x.shape[3]
+            elif x.dim() < 3:
+                # A flat feature vector, (features,) or (1, features), for a
+                # network of fully connected layers: the probe batch is
+                # (batch, 1, 1, features), which those layers read along its
+                # last dimension.
+                if x.dim() == 2 and x.shape[0] != 1:
+                    raise ValueError(
+                        f"the knowledge matrix is computed one input at a time; "
+                        f"got a batch of {x.shape[0]} feature vectors."
+                    )
+                if x.dim() == 1:
+                    x = x.unsqueeze(0)
+                C, H, W = 1, 1, x.shape[-1]
             else:
+                if x.dim() == 4:
+                    # a batch holding one input, (1, C, H, W)
+                    if x.shape[0] != 1:
+                        raise ValueError(
+                            f"the knowledge matrix is computed one input at a time; "
+                            f"got a batch of {x.shape[0]}."
+                        )
+                    x = x[0]
                 C, H, W = x.shape[0], x.shape[1], x.shape[2]
 
             # Total number of positions and batches needed

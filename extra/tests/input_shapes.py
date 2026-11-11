@@ -72,6 +72,113 @@ class TestInputShapes(unittest.TestCase):
             KnowledgeMatrixComputer(mlp((2, 3, 4, 5)))
 
 
+class TestFlatInputs(unittest.TestCase):
+    """
+        A network of fully connected layers may be fed plain feature
+        vectors, (features,) or (1, features), instead of a (C, H, W)
+        tensor -- how MNIST-1D pipelines feed their MLPs. The knowledge
+        matrix is the one obtained from the same vector presented as
+        (1, 1, features).
+    """
+
+    @staticmethod
+    def _net(input_shape, flatten, act="tanh", residual=False):
+        net = NN(input_shape=input_shape, device=DEVICE)
+        if flatten:
+            net.flatten()
+        net.linear(40, 16)
+        getattr(net, act)()
+        if residual:
+            start = net.get_num_layers()
+            net.linear(16, 16)
+            getattr(net, act)()
+            end = net.get_num_layers()
+            net.identity()
+            net.residual(start, end)
+        net.linear(16, 7)
+        net.eval()
+        return net
+
+    def test_forward_accepts_vectors_and_batches(self):
+        torch.manual_seed(0)
+        net = self._net((1, 40), flatten=True)
+        v = torch.randn(40)
+        as_image = net.forward(v.reshape(1, 1, 40))
+        self.assertEqual(net.forward(v).shape, (1, 7))
+        self.assertEqual(net.forward(v.reshape(1, 40)).shape, (1, 7))
+        self.assertTrue(torch.equal(net.forward(v).reshape(-1), as_image.reshape(-1)))
+        self.assertTrue(torch.equal(net.forward(v.reshape(1, 40)).reshape(-1), as_image.reshape(-1)))
+        batch = torch.randn(5, 40)
+        out = net.forward(batch)
+        self.assertEqual(out.shape, (5, 7))
+        for k in range(5):
+            self.assertLess((out[k] - net.forward(batch[k]).reshape(-1)).abs().max().item(), 1e-12)
+
+    def test_matrix_of_a_flat_input(self):
+        for input_shape in ((1, 40), (40,), 40):
+            for flatten in (True, False):
+                for act in ("relu", "tanh", "gelu"):
+                    for residual in (False, True):
+                        with self.subTest(input_shape=input_shape, flatten=flatten, act=act, residual=residual):
+                            torch.manual_seed(1)
+                            net = self._net(input_shape, flatten, act, residual)
+                            v = torch.randn(40)
+                            f = net.forward(v.reshape(1, 40)).reshape(-1)
+                            M_image = KnowledgeMatrixComputer(net, batch_size=16).forward(v.reshape(1, 1, 40))
+                            for x in (v, v.reshape(1, 40)):
+                                M = KnowledgeMatrixComputer(net, batch_size=16).forward(x)
+                                self.assertEqual(M.shape, (7, 41))
+                                self.assertLess((M.sum(1) - f).abs().max().item(), 1e-12)
+                                self.assertLess((M - M_image).abs().max().item(), 1e-12)
+
+    def test_weff_and_bias_column_of_a_flat_input(self):
+        torch.manual_seed(2)
+        net = self._net((1, 40), flatten=True)
+        x = torch.randn(1, 40)
+        computer = KnowledgeMatrixComputer(net, batch_size=16)
+        M = computer.forward(x)
+        W_eff = computer.forward(x, extract_weff=True)
+        self.assertEqual(W_eff.shape, (7, 40))
+        self.assertLess((W_eff * x.reshape(1, -1) - M[:, :-1]).abs().max().item(), 1e-12)
+        self.assertLess((computer.bias_column(x) - M[:, -1]).abs().max().item(), 1e-12)
+
+    def test_the_matrix_takes_one_input_at_a_time(self):
+        net = self._net((1, 40), flatten=True)
+        with self.assertRaises(ValueError):
+            KnowledgeMatrixComputer(net).forward(torch.randn(3, 40))
+
+    def test_a_batch_of_one_image_is_that_image(self):
+        # (1, C, H, W) used to be read as C=1, H=C, W=H
+        torch.manual_seed(3)
+        net = NN(input_shape=(1, 40, 1), device=DEVICE)
+        net.conv(1, 4, kernel_size=(5, 1), stride=(2, 1), padding=(1, 0))
+        net.tanh()
+        net.conv(4, 4, kernel_size=(3, 1), stride=(1, 1), padding=(1, 0))
+        net.relu()
+        net.flatten()
+        net.linear(4 * 19, 6)
+        net.eval()
+        x = torch.randn(1, 40, 1)
+        computer = KnowledgeMatrixComputer(net, batch_size=16)
+        M = computer.forward(x)
+        M_batched = computer.forward(x.unsqueeze(0))
+        self.assertEqual(M.shape, (6, 41))
+        self.assertTrue(torch.equal(M, M_batched))
+        self.assertLess((M.sum(1) - net.forward(x).reshape(-1)).abs().max().item(), 1e-12)
+        self.assertTrue(torch.equal(computer.forward(x.unsqueeze(0), extract_weff=True),
+                                    computer.forward(x, extract_weff=True)))
+        with self.assertRaises(ValueError):
+            computer.forward(torch.randn(2, 1, 40, 1))
+
+    def test_token_ids_without_a_batch_dimension_are_an_error(self):
+        net = NN(input_shape=(1, 1, 8), device=DEVICE)
+        net.embedding(11, 8)
+        net.linear(8, 3)
+        with self.assertRaises(ValueError):
+            net.forward(torch.randint(0, 11, (5,)))
+        self.assertEqual(net.forward(torch.randint(0, 11, (1, 1, 5))).shape, (1, 1, 5, 3))
+
+
 class TestFreezeFeatures(unittest.TestCase):
 
     def _convnet(self):

@@ -1043,8 +1043,21 @@ class NN(nn.Module):
             x = layer(self.to_layer_device(x, i))
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
-        # Update the input shape, useful when the input shape is not known beforehand (e.g. for transformers)
-        self.input_shape = (x.shape[1], x.shape[2], x.shape[3])
+        if x.dim() < 3:
+            # Flat feature vectors -- (features,) or (batch, features) -- for
+            # a network of fully connected layers (an MLP on MNIST-1D, say).
+            # They go through the layers as they are.
+            if start_layer > 0:
+                raise ValueError(
+                    f"after the embedding the input has shape {tuple(x.shape)}: "
+                    f"token ids need a leading batch dimension, (1, T) or (1, 1, T)."
+                )
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
+            self.input_shape = tuple(x.shape[1:])
+        else:
+            # Update the input shape, useful when the input shape is not known beforehand (e.g. for transformers)
+            self.input_shape = (x.shape[1], x.shape[2], x.shape[3])
         inputs_residuals: list[torch.Tensor] = [None] * self.get_num_layers()
         # branch_snapshots holds POST-concat snapshots for branch_input sources;
         # inputs_residuals holds PRE-concat snapshots for residual / concat_skip sources.
