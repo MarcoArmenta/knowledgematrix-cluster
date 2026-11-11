@@ -366,6 +366,7 @@ class TestShardedFullMatrix(unittest.TestCase):
 
                 # segments: across the cut, and on either side of it
                 n, cut = net.get_num_layers(), net.shard_boundaries[0]
+                compared = 0
                 for a, b, final in ((start, n, False), (start, cut, False), (cut, n, False), (cut, n, True)):
                     try:
                         want_seg = ref_comp.segment(x, a, b, final_position_only=final)
@@ -374,6 +375,8 @@ class TestShardedFullMatrix(unittest.TestCase):
                     got_seg = comp.segment(x.to(devices[0]), a, b, final_position_only=final)
                     self.assertEqual(got_seg.device.type, home)
                     assert_close(self, got_seg, want_seg, tol, f"segment ({a}, {b}, final={final})")
+                    compared += 1
+                self.assertEqual(compared, 4)     # none of them was skipped
                 assert_placed(self, net, devices)
 
     # -- the bookkeeping, on one physical device (bitwise equal) --
