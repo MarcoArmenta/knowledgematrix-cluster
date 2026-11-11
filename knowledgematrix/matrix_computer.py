@@ -407,7 +407,10 @@ class KnowledgeMatrixComputer:
 
             # Process bias and batch norm terms by iterating through layers again
             # Computing activation ratios and applying appropriate transformations
-            if self.model._has_bias() or self.model._has_batchnorm() or self.model._has_layernorm() or self.model._has_groupnorm() or self.model._has_gated_product() or len(self.model.residuals) > 0:
+            # (one condition for this method and NN.get_matrix_shape: any
+            # source of a constant term, biases inside composite layers and
+            # the mixing layers themselves included)
+            if self.model.has_bias_column():
                 a = self._bias_pass(x.shape, dtype)
                 a = a.reshape(-1, output_size)
                 return torch.cat((A, a.T.to(self.device)), dim=-1)
