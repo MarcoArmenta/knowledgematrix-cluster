@@ -8,7 +8,9 @@ from knowledgematrix.neural_net import (
     ACTIVATION_LAYERS,
     LINEARIZABLE_LAYERS,
     RMSNorm,
+    GLU,
 )
+from knowledgematrix.matrix_computer import _gated_product
 
 
 class KnowledgeRowComputer:
@@ -33,8 +35,9 @@ class KnowledgeRowComputer:
         Scope: transformer-style models -- Embedding start layer, Linear,
         LayerNorm, RMSNorm, Identity, Dropout, Flatten, activation layers,
         MultiHeadAttention (ratio), GatedAttention / GatedDeltaNet / SwiGLU
-        (ratio or frozen), and residual connections. Convolutional and
-        pooling layers are not supported (use KnowledgeMatrixComputer).
+        (ratio or frozen), GLU (its own alpha split in both modes), and
+        residual connections. Convolutional and pooling layers are not
+        supported (use KnowledgeMatrixComputer).
 
         Args:
             model (NN): The neural network.
@@ -156,6 +159,17 @@ class KnowledgeRowComputer:
                     vertices
                 )
                 B = B * vertices
+            elif isinstance(layer, GLU):
+                # Same linear map as the column pass of
+                # KnowledgeMatrixComputer: the constant act(0) of the gate
+                # carries no input attribution and ends up in the bias entry.
+                u, g, v = model.gated_products[i]
+                c = layer.act(torch.zeros((), dtype=u.dtype, device=u.device))
+                ratio = (g - c) / u
+                ratio = torch.where(torch.isnan(ratio) | torch.isinf(ratio), _zero, ratio)
+                M_g = F.linear(B, layer.gate_proj.weight) * ratio
+                M_v = F.linear(B, layer.value_proj.weight)
+                B = _gated_product(M_g, g, M_v, v, layer.alpha)
             elif isinstance(layer, nn.Linear):
                 B = F.linear(B, layer.weight)
             elif isinstance(layer, nn.LayerNorm):
